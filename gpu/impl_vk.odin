@@ -1013,8 +1013,10 @@ _wait_idle :: proc()
     vk.DeviceWaitIdle(ctx.device)
 }
 
-_swapchain_init :: proc(surface: vk.SurfaceKHR, init_size: [2]u32, frames_in_flight: u32)
+_swapchain_init :: proc(surface_ptr: rawptr, init_size: [2]u32, frames_in_flight: u32)
 {
+    surface := (cast(^vk.SurfaceKHR)surface_ptr)^
+
     if sync.guard(&ctx.lock) {
         ctx.frames_in_flight = frames_in_flight
         ctx.surface = surface
