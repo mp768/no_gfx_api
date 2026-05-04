@@ -1,4 +1,4 @@
-
+#+build !darwin
 package gpu
 
 import "core:slice"
