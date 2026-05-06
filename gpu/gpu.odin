@@ -23,9 +23,18 @@ Command_Buffer :: distinct Handle
 Semaphore :: distinct Handle
 Shader :: distinct Handle
 BVH :: struct { _: Handle }
-Texture_Descriptor :: struct { bytes: [8]u64 }
-Sampler_Descriptor :: struct { bytes: [4]u64 }
-BVH_Descriptor :: struct { bytes: [4]u64 }
+
+when ODIN_OS == .Darwin {
+    // Metal implementaton specific descriptors.
+    Texture_Descriptor :: struct { resource_id: u64 }
+    Sampler_Descriptor :: struct { resource_id: u64 }
+    BVH_Descriptor :: struct { resource_id: u64 }
+} else {
+    // Vulkan implementation specific descriptors.
+    Texture_Descriptor :: struct { bytes: [8]u64 }
+    Sampler_Descriptor :: struct { bytes: [4]u64 }
+    BVH_Descriptor :: struct { bytes: [4]u64 }
+}
 
 // Enums
 Feature :: enum { Raytracing = 0 }
