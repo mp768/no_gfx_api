@@ -93,6 +93,12 @@ Alloc_Info :: struct
     buf_size: u64,
 }
 
+Alloc_Impl_Info :: struct
+{
+    range_end: rawptr,
+    handle: Alloc_Handle,
+}
+
 @(private="file")
 ctx: Context
 
@@ -396,34 +402,38 @@ _mem_alloc_raw :: proc(#any_int el_size, #any_int el_count, #any_int align: i64,
     }
 
     alloc_handle := pool_add(&ctx.allocs, alloc_info, { created_at = loc })
-    p.gpu._impl[0] = u64(uintptr(alloc_handle))
+    end_ptr := rawptr(uintptr(p.gpu.ptr) + uintptr(bytes))
+    alloc_impl := Alloc_Impl_Info { end_ptr, alloc_handle }
+    p.gpu._impl = transmute([2]u64) alloc_impl
     return p
 }
 
 _mem_suballoc :: proc(addr: ptr, offset, el_size, el_count: i64, loc := #caller_location) -> ptr
 {
+    bytes := el_size * el_count
+    
     if ctx.validation
     {
         ok := true
-        if el_size * el_count != 0 {
+        if bytes != 0 {
             ok &= check_ptr(addr, "addr", loc)
         }
         if !ok do return {}
     }
 
-    if el_size * el_count == 0 do return {}
-
-    // NOTE(MP): The TODO comes from the vulkan implementation, which is still
-    // relevant here:
-    // 
-    // TODO: Add suballocation to a suballocation list in allocs.
-    // This lets us do bounds checking on arena allocated pointers for example.
+    if bytes == 0 do return {}
 
     suballoc_p := addr
     if suballoc_p.cpu != nil {
         suballoc_p.cpu = auto_cast(uintptr(suballoc_p.cpu) + uintptr(offset))
     }
     suballoc_p.gpu.ptr = auto_cast(uintptr(suballoc_p.gpu.ptr) + uintptr(offset))
+
+    // Update internal _impl.
+    addr_impl := transmute(Alloc_Impl_Info) addr._impl
+    addr_impl.range_end = rawptr(uintptr(suballoc_p.gpu.ptr) + uintptr(bytes))
+    suballoc_p._impl = transmute([2]u64) addr_impl
+    
     return suballoc_p
 }
 
@@ -436,6 +446,7 @@ _mem_free_raw :: proc(addr: gpuptr, loc := #caller_location)
         ok := true
         if addr != {} {
             ok &= check_ptr(addr, "addr", loc)
+            ok &= check_ptr_must_not_be_suballoc(addr, "addr", loc)
         }
         if !ok do return
     }
@@ -513,4 +524,106 @@ _semaphore_destroy :: proc(sem: Semaphore, loc := #caller_location)
     mtl_sem := pool_get(&ctx.semaphores, sem)
     mtl_sem->release()
     pool_remove(&ctx.semaphores, sem)
+}
+
+
+//////////////////////////////////////
+// Validation
+
+@(private="file")
+check_ptr :: proc(p: gpuptr, name: string, loc: runtime.Source_Code_Location) -> bool
+{
+    if p == {} {
+        log.errorf("'%v' address is nil.", name, location = loc)
+        return false
+    }
+
+    alloc_impl := transmute(Alloc_Impl_Info) p._impl
+    alloc_handle := alloc_impl.handle
+    if !pool_check_no_message(&ctx.allocs, alloc_handle) {
+        log.errorf("'%v' address is stale, has been freed before.", name, location = loc)
+        return false
+    }
+    alloc_info := pool_get(&ctx.allocs, alloc_handle)
+
+    if uintptr(p.ptr) > uintptr(alloc_info.gpu) + uintptr(alloc_info.buf_size) || uintptr(p.ptr) < uintptr(alloc_info.gpu) {
+        log.errorf("'%v' address is out of range for the designated allocation. %v bytes were allocated, but you're attempting to access offset %v.",
+                   name, alloc_info.buf_size, i64(uintptr(p.ptr)) - i64(uintptr(alloc_info.gpu)), location = loc)
+        return false
+    }
+
+    return true
+}
+
+@(private="file")
+check_ptr_allow_nil :: proc(p: gpuptr, name: string, loc: runtime.Source_Code_Location) -> bool
+{
+    if p == {} {
+        return true
+    }
+
+    alloc_impl := transmute(Alloc_Impl_Info) p._impl
+    alloc_handle := alloc_impl.handle
+    if !pool_check_no_message(&ctx.allocs, alloc_handle) {
+        log.errorf("'%v' address is stale, has been freed before.", name, location = loc)
+        return false
+    }
+    alloc_info := pool_get(&ctx.allocs, alloc_handle)
+
+    if uintptr(p.ptr) > uintptr(alloc_info.gpu) + uintptr(alloc_info.buf_size) || uintptr(p.ptr) < uintptr(alloc_info.gpu) {
+        log.errorf("'%v' address is out of range for the designated allocation. %v bytes were allocated, but you're attempting to access offset %v.",
+                   name, alloc_info.buf_size, i64(uintptr(p.ptr)) - i64(uintptr(alloc_info.gpu)), location = loc)
+        return false
+    }
+
+    return true
+}
+
+@(private="file")
+check_ptr_range :: proc(p: gpuptr, #any_int size: i64, name: string, loc: runtime.Source_Code_Location) -> bool
+{
+    if p == {} {
+        log.errorf("'%v' address is nil.", name, location = loc)
+        return false
+    }
+
+    alloc_impl := transmute(Alloc_Impl_Info) p._impl
+    alloc_handle := alloc_impl.handle
+    if !pool_check_no_message(&ctx.allocs, alloc_handle) {
+        log.errorf("'%v' address is stale, has been freed before.", name, location = loc)
+        return false
+    }
+    alloc_info := pool_get(&ctx.allocs, alloc_handle)
+
+    if uintptr(p.ptr) + uintptr(size) > uintptr(alloc_impl.range_end) || uintptr(p.ptr) < uintptr(alloc_info.gpu) {
+        log.errorf("'%v' address is out of range for the designated allocation. %v bytes were allocated, but you're attempting to access [0, %v].",
+                   name, i64(uintptr(alloc_impl.range_end)) - i64(uintptr(p.ptr)), size, location = loc)
+        return true  // Proceed with execution, make sure to clamp accesses.
+    }
+
+    return true
+}
+
+check_ptr_must_not_be_suballoc :: proc(p: gpuptr, name: string, loc: runtime.Source_Code_Location) -> bool
+{
+    if p == {} {
+        log.errorf("'%v' address is nil.", name, location = loc)
+        return false
+    }
+
+    alloc_impl := transmute(Alloc_Impl_Info) p._impl
+    alloc_handle := alloc_impl.handle
+    if !pool_check_no_message(&ctx.allocs, alloc_handle) {
+        log.errorf("'%v' address is stale, has been freed before.", name, location = loc)
+        return false
+    }
+    alloc_info := pool_get(&ctx.allocs, alloc_handle)
+
+    end_ptr := rawptr(uintptr(alloc_info.gpu) + uintptr(alloc_info.buf_size))
+    if uintptr(alloc_impl.range_end) < uintptr(end_ptr) || uintptr(p.ptr) > uintptr(alloc_info.gpu) {
+        log.errorf("'%v' address was suballocated, need an actual allocation here.", name, location = loc)
+        return false
+    }
+
+    return true
 }
