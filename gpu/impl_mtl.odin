@@ -894,17 +894,11 @@ _cmd_copy_to_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, src: gpuptr,
 
     bytes_per_row := mtl_helper_bytes_per_row(dst.format, dst.dimensions[0])
 
-    bytes_per_image: uintptr
-    {
-        // I need to understnd this part more.
-    }
-
-    // TODO(MP): This logic is kind of messy, so I'll take a look at this 
-    // later...
+    bytes_per_image := mtl_helper_bytes_per_image(dst.format, dst.dimensions)
     
     blit_encoder->copyFromBufferEx(
-        src_buf, ns.UInteger(src_offset), ns.UInteger(bytes_per_row),
-        ns.UInteger(),
+        src_buf, ns.UInteger(src_offset), 
+        ns.UInteger(bytes_per_row), ns.UInteger(bytes_per_image),
         mtl.Size { 
             width = ns.Integer(mip_width), 
             height = ns.Integer(mip_height),
