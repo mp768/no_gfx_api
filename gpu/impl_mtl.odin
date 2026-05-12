@@ -38,9 +38,6 @@ Compute_Shader_Push_Constants :: struct #packed {
 Alloc_Handle :: distinct Handle
 
 @(private="file")
-Texture_Info :: struct { handle: ^mtl.Texture }
-
-@(private="file")
 Context :: struct
 {
     validation: bool,
@@ -53,6 +50,10 @@ Context :: struct
     queues: [Queue]^mtl.CommandQueue,
     semaphores: Resource_Pool(Semaphore, ^mtl.SharedEvent),
     textures: Resource_Pool(Texture_Handle, Texture_Info),
+    shaders: Resource_Pool(Shader, Shader_Info),
+    command_buffers: Resource_Pool(Command_Buffer, Command_Buffer_Info),
+    samplers: [dynamic]Sampler_Info,
+    residency_set: ^MTLResidencySet,
 
     // Swapchain (MetalLayer)
     swapchain: Swapchain,
@@ -65,6 +66,47 @@ Context :: struct
     // Separate from the regular lock to allow other work to be done while waiting
     // on swapchain (MetalLayer) specific operations.
     swapchain_lock: sync.Atomic_Mutex, 
+
+    tls_contexts: [dynamic]^Thread_Local_Context,
+}
+
+@(private="file")
+Thread_Local_Context :: struct 
+{
+    current_shaders: [enum { Compute, Vertex, Fragment }]Shader_Info,
+}
+
+@(private="file")
+Texture_Info :: struct { handle: ^mtl.Texture }
+
+@(private="file")
+Sampler_Info :: struct { handle: ^mtl.SamplerState }
+
+@(private="file")
+Shader_Info :: struct 
+{
+    handle: ^mtl.Function,
+
+    // Metadata...
+    is_compute: bool,
+    group_size_x, group_size_y, group_size_z: u32,
+    
+    graphics_type: Shader_Type_Graphics, 
+}
+
+@(private="file")
+Command_Buffer_Info :: struct 
+{
+    handle: ^mtl.CommandBuffer,
+    encoder: union {
+        ^mtl.BlitCommandEncoder,
+        ^mtl.ComputeCommandEncoder,
+        ^mtl.RenderCommandEncoder,
+    },
+    thread_id: int,
+    queue: Queue,
+
+    shader_set: bool,
 }
 
 @(private="file")
@@ -83,7 +125,7 @@ Swapchain :: struct
 Alloc_Info :: struct
 {
     buf_handle: ^mtl.Buffer,
-    heap_handle: ^mtl.Heap, // Only populated for `.Descriptors` allocations
+    heap_handle: ^mtl.Heap, // Only populated for `Allocation_Type.Descriptors` allocations
     
     cpu, gpu: rawptr,
     
@@ -159,6 +201,13 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
     pool_init(&ctx.allocs)
     pool_init(&ctx.semaphores)
     pool_init(&ctx.textures)
+    pool_init(&ctx.shaders)
+
+    residency_desc := MTLResidencySetDescriptor_alloc()
+    residency_desc->init()
+    defer residency_desc->release()
+
+    ctx.residency_set = MTLDevice_makeResidencySet(residency_desc)
 }
 
 _cleanup :: proc(loc := #caller_location) 
@@ -234,7 +283,7 @@ _swapchain_init :: proc(surface_ptr: rawptr, init_size: [2]u32, frames_in_flight
         // 1 seocnd as is the default behavior.
         // 
         // We do this to replicate the behavior present in the vulkan implementation.
-        intr.objc_send(
+        objcMsgSend(
             nil,
             mtl_layer,
             "setAllowsNextDrawableTimeout:",
@@ -439,7 +488,8 @@ _mem_suballoc :: proc(addr: ptr, offset, el_size, el_count: i64, loc := #caller_
 
 _mem_free_raw :: proc(addr: gpuptr, loc := #caller_location)
 {
-    alloc := transmute(Alloc_Handle) addr._impl[0]
+    alloc_impl := transmute(Alloc_Impl_Info) addr._impl
+    alloc := alloc_impl.handle
 
     if ctx.validation
     {
@@ -464,16 +514,249 @@ _mem_free_raw :: proc(addr: gpuptr, loc := #caller_location)
     pool_remove(&ctx.allocs, alloc)
 }
 
+// Textures
 
+_texture_size_and_align :: proc(desc: Texture_Desc, loc := #caller_location) -> (size: u64, align: u64)
+{
+    desc_clean := texture_desc_cleanup(desc)
 
+    tex_desc := to_mtl_texture_descriptor(desc_clean)
+    defer tex_desc->release()
+
+    _size, _align := (ctx.device)->heapTextureSizeAndAlignWithDescriptor(tex_desc)
+
+    return u64(_size), u64(_align)
+}
+
+_texture_create :: proc(desc: Texture_Desc, storage: gpuptr, queue: Queue = .Main, signal_sem: Semaphore = {}, signal_value: u64 = 0, name := "", loc := #caller_location) -> Texture 
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= check_ptr(storage, "storage", loc)
+        if !ok do return {}
+    }
+
+    desc_clean := texture_desc_cleanup(desc)
+
+    alloc_impl := transmute(Alloc_Impl_Info) storage._impl
+    alloc_info := pool_get(&ctx.allocs, alloc_impl.handle)
+
+    mtl_buf := alloc_info.buf_handle
+
+    offset := uintptr(storage.ptr) - uintptr(alloc_info.gpu)
+    tex_desc := to_mtl_texture_descriptor(desc_clean)
+    defer tex_desc->release()
+
+    bytes_per_row := mtl_helper_bytes_per_row(desc.format, desc.dimensions[0])
+
+    // TODO: Figure out something semantically equivalent to the `cmd_add_signal_semaphore`
+    // usage in the original vulkan implementaton. Since we don't need to make use of a
+    // separate command buffer to handle the creation of an image in the format we want,
+    // I don't see why we'd have to wait on a semaphore to perform texture creation on this
+    // backend.
+    
+    mtl_tex := (mtl_buf)->newTexture(tex_desc, ns.UInteger(offset), ns.UInteger(bytes_per_row))
+
+    debug_name_objc := to_mtl_string(name)
+    defer debug_name_objc->release()
+    
+    mtl_tex->setLabel(debug_name_objc)
+    
+    tex_info := Texture_Info { handle = mtl_tex }
+    return Texture {
+        dimensions = desc_clean.dimensions,
+        format = desc_clean.format,
+        mip_count = desc_clean.mip_count,
+        sample_count = desc_clean.sample_count,
+        handle = pool_add(&ctx.textures, tex_info, { name = name, created_at = loc } )
+    }
+}
+
+_texture_destroy :: proc(texture: Texture, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.textures, texture.handle, "texture", loc)
+        if !ok do return
+    }
+
+    tex_info := pool_get(&ctx.textures, texture.handle)
+
+    (tex_info.handle)->release()
+
+    pool_remove(&ctx.textures, texture.handle)
+}
+
+_texture_view_descriptor :: proc(texture: Texture, view_desc: Texture_View_Desc, loc := #caller_location) -> Texture_Descriptor
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.textures, texture.handle, "texture", loc)
+        if !ok do return {}
+    }
+
+    tex_info := pool_get(&ctx.textures, texture.handle)
+
+    (ctx.residency_set)->addAllocation(tex_info.handle)
+    
+    return Texture_Descriptor {
+        resource_id = u64((tex_info.handle)->gpuResourceID()) 
+    }
+}
+
+_texture_rw_view_descriptor :: proc(texture: Texture, view_desc: Texture_View_Desc, loc := #caller_location) -> Texture_Descriptor
+{
+    // NOTE(MP): The distinction in how this resource is accessed is at texture
+    // creation, thus we don't need to specify anything special for the shader to 
+    // recognize this as a texture we can read and write to.
+    return _texture_view_descriptor(
+        texture,
+        view_desc,
+        loc = loc,
+    )
+}
+
+_sampler_descriptor :: proc(sampler_desc: Sampler_Desc, loc := #caller_location) -> Sampler_Descriptor
+{
+    if sampler_desc.max_anisotropy != 0.0 {
+        ensure(
+            sampler_desc.max_anisotropy >= 1.0 &&
+            // NOTE(MP): This seems to be the cap for metal.
+            sampler_desc.max_anisotropy <= 16.0,
+            "Sampler anisotropy out of range. Call gpu.device_limits() to get the supported maximum anisotropy.",
+        )
+    }
+
+    desc := mtl.SamplerDescriptor_alloc()
+    desc->init()
+    defer desc->release()
+
+    desc->setMagFilter(to_mtl_filter(sampler_desc.mag_filter))
+    desc->setMinFilter(to_mtl_filter(sampler_desc.min_filter))
+    desc->setMipFilter(to_mtl_filter(sampler_desc.mip_filter))
+
+    desc->setSAddressMode(to_mtl_address_mode(sampler_desc.address_mode_u))
+    desc->setTAddressMode(to_mtl_address_mode(sampler_desc.address_mode_v))
+    desc->setRAddressMode(to_mtl_address_mode(sampler_desc.address_mode_w))
+
+    MTLSamplerDescriptor_setLodBias(desc, ns.Float(sampler_desc.mip_lod_bias))
+    desc->setLodMinClamp(sampler_desc.min_lod)
+    desc->setLodMaxClamp(sampler_desc.max_lod)
+
+    desc->setMaxAnisotropy(sampler_desc.max_anisotropy)
+
+    sampler := (ctx.device)->newSamplerState(desc)
+
+    if sync.guard(&ctx.lock) {
+        append(&ctx.samplers, sampler)
+    }
+
+    return Sampler_Descriptor {
+        resource_id = u64(sampler->gpuResourceID()) 
+    }
+}
+
+_texture_view_descriptor_size :: proc() -> u32
+{
+    return size_of(Texture_Descriptor)
+}
+
+_texture_rw_view_descriptor_size :: proc() -> u32 
+{
+    return size_of(Texture_Descriptor)
+}
+
+_sampler_descriptor_size :: proc() -> u32 
+{
+    return size_of(Sampler_Descriptor)
+}
+
+// Shaders 
+
+@(private="file")
+_shader_create_internal :: proc(code: []u32, is_compute: bool, graphics_type: Shader_Type_Graphics, entry_point_name := "main", group_size_x: u32 = 1, group_size_y: u32 = 1, group_size_z: u32 = 1, name: string, loc: runtime.Source_Code_Location) -> Shader
+{
+    // NOTE(MP): I hate this solution, but it's the only way... (maybe)
+    shader_source_code := string(slice.reinterpret([]u8, code))
+
+    shader_source_code_objc := ns.String_alloc()
+    defer shader_source_code_objc->release()
+
+    shader_source_code_objc->initWithOdinString(shader_source_code)
+    
+    compile_options := mtl.CompileOptions_alloc()
+    compile_options->init()
+    defer compile_options->release()
+
+    lib: ^mtl.Library
+    err: ^ns.Error
+    lib, err = (ctx.device)->newLibraryWithSource(shader_source_code_objc, compile_options)
+
+    if err != nil {
+        description := err->localizedDescription()
+        if is_compute {
+            log.fatalf("Compute shader creation failed for '%v' entry point. Reason: %v\n", entry_point_name, description->odinString())
+        } else {
+            log.fatalf("Graphics shader creation failed for '%v' entry point on %v stage. Reason: %v\n", entry_point_name, graphics_type, description->odinString())
+        }
+        return nil
+    }
+    
+    entry_point_name_objc := ns.String_alloc()
+    defer entry_point_name_objc->release()
+
+    entry_point_name_objc->initWithOdinString(entry_point_name)
+    
+    function := lib->newFunctionWithName(entry_point_name_objc)
+    defer lib->release()
+    
+    debug_name_objc := to_mtl_string(name)
+    defer debug_name_objc->release()
+
+    function->setLabel(debug_name_objc)
+
+    shader_ref: Shader = pool_add(&ctx.shaders, Shader_Info {
+        handle = function,
+        is_compute = is_compute,
+        group_size_x = group_size_x,
+        group_size_y = group_size_y,
+        group_size_z = group_size_z,
+        graphics_type = graphics_type
+    })
+
+    return shader_ref
+}
+
+_shader_create :: proc(code: []u32, type: Shader_Type_Graphics, entry_point_name := "main", name := "", loc := #caller_location) -> Shader
+{
+    return _shader_create_internal(code, false, type, entry_point_name, name=name, loc=loc)
+}
+
+_shader_create_compute :: proc(code: []u32, group_size_x: u32, group_size_y: u32 = 1, group_size_z: u32 = 1, entry_point_name := "main", name := "", loc := #caller_location) -> Shader
+{
+    return _shader_create_internal(code, true, .Vertex, entry_point_name, group_size_x, group_size_y, group_size_z, name=name, loc=loc)
+}
+
+_shader_destroy :: proc(shader: Shader, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.shaders, shader, "shader", loc)
+        if !ok do return
+    }
+
+    shader_info := pool_get(&ctx.shaders, shader)
+
+    (shader_info.handle)->release()
+
+    pool_remove(&ctx.shaders, shader)
+}
 
 // Semaphores
-
-// A helper procedure since this wasn't already implemented.
-@(private="file")
-SharedEvent_wait :: #force_inline proc "c" (self: ^mtl.SharedEvent, untilSignaledValue: u64, timeoutMS: u64) -> mtl.BOOL {
-	return intr.objc_send(mtl.BOOL, self, "waitUntilSignaledValue:timeoutMS:", untilSignaledValue, timeoutMS)
-}
 
 _semaphore_create :: proc(init_value: u64 = 0, name := "", loc := #caller_location) -> Semaphore
 {
@@ -526,6 +809,176 @@ _semaphore_destroy :: proc(sem: Semaphore, loc := #caller_location)
     pool_remove(&ctx.semaphores, sem)
 }
 
+// Command buffer
+
+_commands_begin :: proc(queue: Queue, loc := #caller_location) -> Command_Buffer
+{
+    mtl_queue := ctx.queues[queue]
+
+    mtl_cmd := mtl_queue->commandBuffer()
+
+    cmd_buf_info := Command_Buffer_Info { 
+        handle = mtl_cmd,
+        encoder = nil,
+        thread_id = sync.current_thread_id(),
+        queue = queue,
+
+        shader_set = false,
+    }
+
+    return pool_add(&ctx.command_buffers, cmd_buf_info)
+}
+
+// Commands
+
+_cmd_mem_copy_raw :: proc(cmd_buf: Command_Buffer, dst, src: gpuptr, #any_int bytes: i64, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.command_buffers, cmd_buf, "cmd_buf", loc)
+        if bytes > 0
+        {
+            ok &= check_ptr_range(dst, bytes, "dst", loc)
+            ok &= check_ptr_range(src, bytes, "src", loc)
+        }
+        if !ok do return
+    }
+
+    if bytes == 0 do return
+
+    blit_encoder := mtl_get_blit_encoder(cmd_buf)
+
+    src_buf, src_offset, _ := get_buf_offset_from_gpu_ptr(src)
+    dst_buf, dst_offset, _ := get_buf_offset_from_gpu_ptr(dst)
+
+    // Clamp copy regions
+    to_copy: uintptr
+    if uintptr(src_offset) > uintptr(src_alloc_info.buf_size) || uintptr(dst_offset) > uintptr(dst_alloc_info.buf_size) {
+        to_copy = 0
+    } else {
+        to_copy = min(uintptr(bytes), min(uintptr(src_alloc_info.buf_size) - uintptr(src_offset), uintptr(dst_alloc_info.buf_size) - uintptr(dst_offset)))
+    }
+
+    if to_copy <= 0 do return
+
+    blit_encoder->copyFromBuffer(
+        src_buf, ns.UInteger(src_offset), 
+        dst_buf, ns.UInteger(dst_offset), 
+        ns.UInteger(to_copy)
+    )
+}
+
+_cmd_copy_to_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, src: gpuptr, region: Texture_Region = {}, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.command_buffers, cmd_buf, "cmd_buf", loc)
+        ok &= pool_check(&ctx.textures, dst.handle, "dst", loc)
+        ok &= check_ptr(src, "src", loc)
+        if !ok do return
+    }
+
+    blit_encoder := mtl_get_blit_encoder(cmd_buf)
+    tex_info := pool_get(&ctx.textures, dst.handle)
+
+    src_buf, src_offset, ok_s := get_buf_offset_from_gpu_ptr(src)
+    assert(ok_s)
+
+    is_compressed := is_block_compressed(dst.format)
+
+    mip_width := max(1, dst.dimensions.x >> region.mip_level)
+    mip_height := max(1, dst.dimensions.y >> region.mip_level)
+    mip_depth := max(1, dst.dimensions.z >> region.mip_level)
+
+    bytes_per_row := mtl_helper_bytes_per_row(dst.format, dst.dimensions[0])
+
+    bytes_per_image: uintptr
+    {
+        // I need to understnd this part more.
+    }
+
+    // TODO(MP): This logic is kind of messy, so I'll take a look at this 
+    // later...
+    
+    blit_encoder->copyFromBufferEx(
+        src_buf, ns.UInteger(src_offset), ns.UInteger(bytes_per_row),
+        ns.UInteger(),
+        mtl.Size { 
+            width = ns.Integer(mip_width), 
+            height = ns.Integer(mip_height),
+            depth = ns.Integer(mip_depth),
+        },
+
+        tex_info.handle, 
+    )
+}
+
+//////////////////////////////////////
+// Command Helpers
+
+// NOTE(MP): These "get_X_encoder" procs are used because we don't have a set
+// "pass" that these types of commands can occur in. Thus, we have to figure out
+// if the current command belongs alongside various commands before it on the fly.
+
+@(private="file")
+mtl_get_compute_encoder :: proc(cmd: Command_Buffer) -> ^mtl.ComputeCommandEncoder
+{
+    info, lock := pool_get_mut(&ctx.command_buffers, cmd); sync.guard(lock)
+
+    switch encoder in info.encoder
+    {
+        case: // do nothing
+        case ^mtl.BlitCommandEncoder: encoder->endEncoding()
+        case ^mtl.RenderCommandEncoder: encoder->endEncoding()
+        case ^mtl.ComputeCommandEncoder:
+            return encoder
+    }
+    
+    compute_encoder := (info.handle)->computeCommandEncoder()
+    info.encoder = compute_encoder
+    return compute_encoder
+}
+
+@(private="file")
+mtl_get_blit_encoder :: proc(cmd: Command_Buffer) -> ^mtl.BlitCommandEncoder
+{
+    info, lock := pool_get_mut(&ctx.command_buffers, cmd); sync.guard(lock)
+
+    switch encoder in info.encoder
+    {
+        case: // do nothing
+        case ^mtl.ComputeCommandEncoder: encoder->endEncoding()
+        case ^mtl.RenderCommandEncoder: encoder->endEncoding()
+        case ^mtl.BlitCommandEncoder:
+            return encoder
+    }
+    
+    blit_encoder := (info.handle)->blitCommandEncoder()
+    info.encoder = blit_encoder
+    return blit_encoder
+}
+
+@(private="file")
+mtl_end_cmd_buf_encoding :: proc(cmd: Command_Buffer) 
+{
+    info, lock := pool_get_mut(&ctx.command_buffers, cmd); sync.guard(lock)
+
+    // Unfortunately, since the encoders are wrapped in a union,
+    // we can't make use of the generic `endEncoding` method present
+    // on all encoders easily (at least not in a safe manner). So,
+    // this is how we handle it. 
+    switch encoder in info.encoder
+    {
+        case: // Do nothing
+        case ^mtl.BlitCommandEncoder: encoder->endEncoding()
+        case ^mtl.RenderCommandEncoder: encoder->endEncoding()
+        case ^mtl.ComputeCommandEncoder: encoder->endEncoding()
+    }
+
+    info.encoder = nil
+}
 
 //////////////////////////////////////
 // Validation
@@ -626,4 +1079,27 @@ check_ptr_must_not_be_suballoc :: proc(p: gpuptr, name: string, loc: runtime.Sou
     }
 
     return true
+}
+
+@(private="file")
+get_buf_offset_from_gpu_ptr :: proc(p: gpuptr) -> (buf: ^mtl.Buffer, offset: u32, ok: bool)
+{
+    if p == {} do return {}, {}, false
+
+    alloc_impl := transmute(Alloc_Impl_Info) p._impl
+    alloc_info := pool_get(&ctx.allocs, alloc_impl.handle)
+
+    buf = alloc_info.buf_handle
+    offset = u32(uintptr(p.ptr) - uintptr(alloc_info.gpu))
+    return buf, offset, true
+}
+
+@(private="file")
+get_buf_size_from_gpu_ptr :: proc(p: gpuptr) -> (size: u64, ok: bool)
+{
+    if p == {} do return {}, false
+
+    alloc_impl := transmute(Alloc_Impl_Info) p._impl
+    alloc_info := pool_get(&ctx.allocs, alloc_impl.handle)
+    return alloc_info.buf_size, true
 }
