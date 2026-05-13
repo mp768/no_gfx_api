@@ -94,6 +94,31 @@ mtl_helper_bytes_per_image :: proc(format: Texture_Format, dimensions: [3]u32) -
     return 0
 }
 
+mtl_helper_dimensions_by_texture_format :: proc(format: Texture_Format, dimensions: [3]u32) -> [3]u32
+{
+    switch format 
+    {
+        case .Default: panic("Implementation bug!")
+
+        // These don't need to be altered...
+        case .RGBA8_Unorm, .BGRA8_Unorm, .RGBA8_SRGB, 
+             .D32_Float, .RGBA16_Float, .RGBA32_Float: 
+            return dimensions
+
+        // NOTE(MP): Don't know enough to implement these.
+        case .BC1_RGBA_Unorm: panic("Dimensions based on texture format for BC1_RGBA_Unorm is unimplemented!")
+        case .BC3_RGBA_Unorm: panic("Dimensions based on texture format for BC3_RGBA_Unorm is unimplemented!")
+        case .BC7_RGBA_Unorm: panic("Dimensions based on texture format for BC7_RGBA_Unorm is unimplemented!")
+        case .ASTC_4x4_RGBA_Unorm: panic("Dimensions based on texture format for ASTC_4x4_RGBA_Unorm is unimplemented!")
+        case .ETC2_RGB8_Unorm: panic("Dimensions based on texture format for ETC2_RGB8_Unorm is unimplemented!")
+        case .ETC2_RGBA8_Unorm: panic("Dimensions based on texture format for ETC2_RGBA8_Unorm is unimplemented!")
+        case .EAC_R11_Unorm: panic("Dimensions based on texture format for EAC_R11_Unorm is unimplemented!")
+        case .EAC_RG11_Unorm: panic("Dimensions based on texture format for EAC_RG11_Unorm is unimplemented!")
+    }
+    
+    return dimensions
+}
+
 to_mtl_filter :: proc(filter: Filter) -> mtl.SamplerMinMagFilter
 {
     switch filter

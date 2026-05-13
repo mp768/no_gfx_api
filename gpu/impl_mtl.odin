@@ -107,6 +107,20 @@ Command_Buffer_Info :: struct
     queue: Queue,
 
     shader_set: bool,
+
+    // These are fields related to setting up the descriptor heap for the 
+    // current command buffer. This allow us to have a handle on these resources in
+    // our shaders.
+    textures, textures_rw, samplers, bvhs: ^mtl.Buffer,
+
+    wait_sems, signal_sems: [dynamic]Semaphore_Value,
+}
+
+@(private="file")
+Semaphore_Value :: struct
+{
+    sem: Semaphore,
+    val: u64,
 }
 
 @(private="file")
@@ -895,18 +909,142 @@ _cmd_copy_to_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, src: gpuptr,
     bytes_per_row := mtl_helper_bytes_per_row(dst.format, dst.dimensions[0])
 
     bytes_per_image := mtl_helper_bytes_per_image(dst.format, dst.dimensions)
-    
-    blit_encoder->copyFromBufferEx(
-        src_buf, ns.UInteger(src_offset), 
-        ns.UInteger(bytes_per_row), ns.UInteger(bytes_per_image),
-        mtl.Size { 
-            width = ns.Integer(mip_width), 
-            height = ns.Integer(mip_height),
-            depth = ns.Integer(mip_depth),
-        },
 
-        tex_info.handle, 
-    )
+    new_dimensions := mtl_helper_dimensions_by_texture_format(dst.format, { mip_width, mip_height, mip_depth })
+
+    // TODO: Somebody please look over this... I don't know if I've implemented this
+    // correctly at all...
+    for _index in 0..<region.layer_count { 
+        layer := region.base_layer + _index
+        
+        blit_encoder->copyFromBufferEx(
+            src_buf, ns.UInteger(src_offset), 
+            ns.UInteger(bytes_per_row), ns.UInteger(bytes_per_image),
+            mtl.Size { 
+                width = ns.Integer(new_dimensions[0]), 
+                height = ns.Integer(new_dimensions[1]),
+                depth = ns.Integer(new_dimensions[2]),
+            },
+    
+            tex_info.handle, 
+            ns.UInteger(layer),
+            ns.UInteger(region.mip_level),
+            mtl.Origin { 0, 0, 0 }
+        )
+    }
+}
+
+_cmd_blit_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, dst_rect: Blit_Rect, src: Texture, src_rect: Blit_Rect, filter: Filter, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.command_buffers, cmd_buf, "cmd_buf", loc)
+        ok &= check_cmd_buf_must_be_graphics(cmd_buf, "cmd_buf", loc)
+        if !ok do return
+    }
+
+    blit_encoder := mtl_get_blit_encoder(cmd_buf)
+    src_info := pool_get(&ctx.textures, src.handle)
+    dst_info := pool_get(&ctx.textures, dst.handle)
+
+    mtl_filter := to_mtl_filter(filter)
+
+    // TODO(MP): Complete this method later... It's stressing me out. I'll hopefully
+    // have a better grasp of this texture stuff later.
+    
+    // blit_encoder->copyFromTextureWithDestinationOrigin(
+        // 
+    // )
+}
+
+_cmd_set_desc_heap :: proc(cmd_buf: Command_Buffer, textures, textures_rw, samplers, bvhs: gpuptr, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.command_buffers, cmd_buf, "cmd_buf", loc)
+        ok &= check_ptr_allow_nil(textures, "textures", loc)
+        ok &= check_ptr_allow_nil(textures_rw, "textures_rw", loc)
+        ok &= check_ptr_allow_nil(samplers, "samplers", loc)
+        ok &= check_ptr_allow_nil(bvhs, "bvhs", loc)
+        if !ok do return
+    }
+
+    cmd_info, lock := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(lock)
+
+    if textures != {}
+    {
+        impl_info := transmute(Alloc_Impl_Info)textures._impl
+        alloc_info := pool_get(&ctx.allocs, impl_info.handle)
+
+        cmd_info.textures = alloc_info.buf_handle
+    } else do cmd_info.textures = nil
+
+    if textures_rw != {}
+    {
+        impl_info := transmute(Alloc_Impl_Info)textures_rw._impl
+        alloc_info := pool_get(&ctx.allocs, impl_info.handle)
+
+        cmd_info.textures_rw = alloc_info.buf_handle
+    } else do cmd_info.textures_rw = nil
+
+    if samplers != {}
+    {
+        impl_info := transmute(Alloc_Impl_Info)samplers._impl
+        alloc_info := pool_get(&ctx.allocs, impl_info.handle)
+
+        cmd_info.samplers = alloc_info.buf_handle
+    } else do cmd_info.samplers = nil
+
+    if bvhs != {} && .Raytracing in ctx.features
+    {
+        impl_info := transmute(Alloc_Impl_Info)bvhs._impl
+        alloc_info := pool_get(&ctx.allocs, impl_info.handle)
+
+        cmd_info.bvhs = alloc_info.buf_handle
+    } else do cmd_info.bvhs = nil
+}
+
+_cmd_add_wait_semaphore :: proc(cmd_buf: Command_Buffer, sem: Semaphore, wait_value: u64, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.command_buffers, cmd_buf, "cmd_buf", loc)
+        ok &= check_cmd_buf_must_be_recording(cmd_buf, "cmd_buf", loc)
+        ok &= pool_check(&ctx.semaphores, sem, "sem", loc)
+        if !ok do return
+    }
+
+    cmd_buf_info, r_lock := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(r_lock)
+    append(&cmd_buf_info.wait_sems, Semaphore_Value { sem = sem, val = wait_value })
+}
+
+_cmd_add_signal_semaphore :: proc(cmd_buf: Command_Buffer, sem: Semaphore, signal_value: u64, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.command_buffers, cmd_buf, "cmd_buf", loc)
+        ok &= check_cmd_buf_must_be_recording(cmd_buf, "cmd_buf", loc)
+        ok &= pool_check(&ctx.semaphores, sem, "sem", loc)
+        if !ok do return
+    }
+
+    cmd_buf_info, r_lock := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(r_lock)
+    append(&cmd_buf_info.signal_sems, Semaphore_Value { sem = sem, val = signal_value })
+}
+
+_cmd_barrier :: proc(cmd_buf: Command_Buffer, before: Stage, after: Stage, hazards: Hazard_Flags = {}, loc := #caller_location)
+{
+    if ctx.validation
+    {
+        ok := true
+        ok &= pool_check(&ctx.command_buffers, cmd_buf, "cmd_buf", loc)
+        if !ok do return
+    }
+
 }
 
 //////////////////////////////////////
@@ -931,6 +1069,23 @@ mtl_get_compute_encoder :: proc(cmd: Command_Buffer) -> ^mtl.ComputeCommandEncod
     }
     
     compute_encoder := (info.handle)->computeCommandEncoder()
+
+    if info.textures != nil {
+        compute_encoder->setBuffer(info.textures, 0, 0)
+    }
+
+    if info.textures_rw != nil {
+        compute_encoder->setBuffer(info.textures_rw, 0, 1)
+    }
+
+    if info.samplers != nil {
+        compute_encoder->setBuffer(info.samplers, 0, 2)
+    }
+
+    if info.bvhs != nil {
+        compute_encoder->setBuffer(info.bvhs, 0, 3)
+    }
+    
     info.encoder = compute_encoder
     return compute_encoder
 }
