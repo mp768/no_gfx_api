@@ -2472,7 +2472,7 @@ _cmd_barrier :: proc(cmd_buf: Command_Buffer, before: Stage, after: Stage, hazar
     if card(hazards) == 0
     {
         src_access = { .MEMORY_WRITE }
-        dst_access = { .MEMORY_READ }
+        dst_access = { .MEMORY_READ, .MEMORY_WRITE }
     }
 
     barrier := vk.MemoryBarrier {
