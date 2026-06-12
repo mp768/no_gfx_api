@@ -1,0 +1,227 @@
+---
+
+Defs: ../definitions/macos/appkit.json
+
+Mono  : { Emit: false }
+CSharp: { Emit: false }
+
+Cpp:
+  Emit: false
+  ExportInternals: true
+  DontWrapCFunctions: true
+  ExportForwardDeclarations: true
+  
+  ExportTypes:
+    - ^_*NS.+
+
+  ExportMethods:
+    - ^::NS.+
+
+  ExportVars:
+    - ^::k?NS.+
+
+  IgnoreTypes  : []
+  IgnoreMethods: []
+
+
+Odin:
+  Emit             : true
+  ExportPath       : ..
+  BasePackageName  : darwodin
+  SingleFile       : false
+  EmitObjCExtenders: true
+  TargetPlatform   : Darwin
+  ExportTypeMapDir : ../exports
+  ExternalTypes:
+    - ../mach/exports/mach.exports.yml
+    - ../libc/libc.exports.yml
+    - ../exports/CoreFoundation.exports.yml
+    - ../exports/CoreGraphics.exports.yml
+    - ../exports/CoreText.exports.yml
+    - ../exports/Security.exports.yml
+    - ../exports/Foundation.exports.yml
+    - ../exports/QuartzCore.exports.yml
+
+  ExternalPackageMap: { darwin_libc: '../libc' }
+
+  ReExportPackages: [ Foundation ]
+
+  ResolvedTypedefs:
+    - '[su]?int.*'
+
+  Packages:
+    - Name  : AppKit
+      Export: AK
+      DarwinLinkLibs: [system:AppKit.framework]
+      RequiredLink: true
+      Filter: .*
+
+      Imports:
+        - |
+          OpaqueSecTransformImplementation :: struct {}
+          OpaqueSecIdentitySearchRef :: struct {}
+          OpaquePolicySearchRef :: struct {}
+          OpaqueIconRef :: struct {}
+          CVTimeStamp :: struct {}
+
+          CIBarcodeDescriptor :: NS.Object
+          CKShare :: NS.Object
+          CKContainer :: NS.Object
+          CIImage :: NS.Object
+          INIntent :: NS.Object
+          CIColor :: NS.Object
+          CIFilter  :: NS.Object
+          CIContext :: NS.Object
+          CKShareMetadata :: NS.Object
+          QTMovie :: NS.Object
+          UTType :: NS.Object
+
+          GCGamepadSnapShotDataV100         :: struct {}
+          GCExtendedGamepadSnapshotData     :: struct {}
+          GCExtendedGamepadSnapShotDataV100 :: struct {}
+          GCMicroGamepadSnapshotData        :: struct {}
+          GCMicroGamepadSnapShotDataV100    :: struct {}
+
+          // Helper array iterator
+          Array_Iterator :: struct($T: typeid) {
+              array: ^NS.Array,
+              length: int,
+              index:  int,
+          }
+
+          array_iter :: proc( $T: typeid, array: ^NS.Array ) -> Array_Iterator(T) {
+              return Array_Iterator(T) {
+                  array  = array,
+                  length = int(array->count()),
+                  index  = 0,
+              }
+          }
+
+          array_next :: proc( it: ^Array_Iterator($T) ) -> (val: ^T, idx: int, cond: bool) {
+              if it.index >= it.length {
+                  return
+              }
+
+              val      = auto_cast it.array->objectAtIndex(auto_cast it.index)
+              it.index += 1
+              cond     = true
+              return
+          }
+
+          to_ns_string :: #force_inline proc "contextless" ( str: string ) -> ^String {
+              return String.alloc()->initWithBytes(raw_data(str), UInteger(len(str)), UTF8StringEncoding)
+          }
+
+          to_ns_string_no_copy :: #force_inline proc "contextless" ( str: string ) -> ^String {
+              return String.alloc()->initWithBytesNoCopy(raw_data(str), UInteger(len(str)), UTF8StringEncoding, false)
+          }
+
+          to_odin_string :: proc( ns_str: ^String, allocator := context.allocator ) -> string {
+              length := ns_str->lengthOfBytesUsingEncoding(UTF8StringEncoding)
+              dest := make([]u8, int(length)+1, allocator)
+
+              runtime.mem_copy_non_overlapping(raw_data(dest), rawptr(ns_str->UTF8String()), int(length))
+              return string(dest[:length])
+          }
+
+          tmp_to_odin_string :: #force_inline proc ( ns_str: ^String ) -> string {
+              return to_odin_string(ns_str, context.temp_allocator)
+          }
+
+          STR :: #force_inline proc "contextless" ( #const s: cstring ) -> ^String {
+              return auto_cast CF.STR(s)
+          }
+
+
+  
+      TypeMap:
+        CKShare: CKShare
+        CKShareMetadata: CKShareMetadata
+        CKContainer: CKContainer
+        INIntent: INIntent
+        CIImage: CIImage
+        CIColor: CIColor
+        CIFilter: CIFilter
+        CIContext: CIContext
+        QTMovie: QTMovie
+        UTType: UTType
+        CVTimeStamp: CVTimeStamp
+
+        # CG
+        GCGamepadSnapShotDataV100: GCGamepadSnapShotDataV100
+        GCExtendedGamepadSnapshotData: GCExtendedGamepadSnapshotData
+        GCExtendedGamepadSnapShotDataV100: GCExtendedGamepadSnapShotDataV100
+        GCMicroGamepadSnapshotData: GCMicroGamepadSnapshotData
+        GCMicroGamepadSnapShotDataV100: GCMicroGamepadSnapShotDataV100
+
+      IgnoreExtendObjCTypes:
+        - ^NSOpenGLLayer$
+
+  # Symbol Transformers
+  EnumTransforms:
+  - Type: ^NSEventModifierFlags$
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: NSEventModifierFlag
+  - Type: ^NSFontAssetRequestOptions$
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: NSFontAssetRequestOption
+  - Type: ^NSApplicationPrintReply$
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: NSPrinting
+  - Type: ^NSImageScaling$
+    Transforms:
+    - Kind  : ReplacePrefix
+      Source: NSScale
+      Target: DEPRECATED_
+    - Kind  : RemovePrefix
+      Source: NSImageScale
+  - Type: .*
+    Transforms:
+      - Kind  : RemoveTypeWordsFromElements
+      # - Kind  : RemovePartialTypeNamePrefix
+      - Kind  : RemoveUnderscorePrefix
+      - Kind  : UnderscoreNumbers
+  - Type: Flags$
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: Flag
+
+  TypeTransforms:
+    - Type: ^(NS).+
+      Transforms:
+      - Kind  : RemovePrefix
+        Source: $group0
+    - Type: Flag$ # Transforms for bit_set types
+      Transforms:
+      - Kind  : AppendSuffix
+        Source: s
+    - Type: Mask$
+      Transforms:
+      - Kind  : None
+
+  BitSetMap:
+    - Type: Flags?$
+      Transforms:
+        - Kind  : RemoveSuffix
+          Source: s
+    - Type: Mask$
+      Transforms:
+        - Kind  : AppendSuffix
+          Source: Flag
+
+  ProcTransforms:
+  - Type: ^(_*NS).+
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: $group0
+
+  VarTransforms:
+    - Type: ^(_*NS).+
+      Transforms:
+        - Kind  : RemovePrefix
+          Source: $group0
+        - Kind  : RemoveUnderscorePrefix
+        - Kind  : UnderscoreNumbers

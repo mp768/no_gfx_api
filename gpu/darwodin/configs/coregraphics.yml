@@ -1,0 +1,134 @@
+---
+
+Defs: ../definitions/macos/coregraphics.json
+
+Mono  : { Emit: false }
+CSharp: { Emit: false }
+
+Cpp:
+  Emit: false
+  ExportInternals: true
+  DontWrapCFunctions: true
+  ExportForwardDeclarations: true
+  
+  ExportTypes:
+    - ^(_*CG|GrafP|OpaqueGraf).*
+    - ^ColorSyncProfile
+    - ^ColorSyncProfileRef
+    - ^_*IOSurface
+
+
+  ExportMethods:
+    - ^::CG.+
+
+  ExportVars:
+    - ^::k?CG.+
+
+  IgnoreTypes  : []
+  IgnoreMethods: []
+
+
+Odin:
+  Emit           : true
+  ExportPath     : ..
+  BasePackageName: darwodin
+  SingleFile     : false
+  TargetPlatform : Darwin
+  ExportTypeMapDir: ../exports
+
+  ExternalPackageMap:
+    darwin_libc: '../libc'
+
+  ExternalTypes:
+    - ../mach/exports/mach.exports.yml
+    - ../libc/libc.exports.yml
+    - ../exports/CoreFoundation.exports.yml
+
+  ResolvedTypedefs:
+    - off_t
+    - boolean_t
+    - '[su]?int.*'
+
+  NonDistinctTypeDefs:
+    - ^CGFloat$
+
+  Packages:
+    - Name  : CoreGraphics
+      Export: CG
+      DarwinLinkLibs: [system:CoreGraphics.framework]
+      RequiredLink: true
+      Filter: .*
+
+      Imports:
+        - |
+          NSObject  :: intrinsics.objc_object
+          MTLDevice :: intrinsics.objc_object
+          cl_device_id :: struct {}
+
+          when ODIN_PLATFORM_SUBTARGET == .Default {
+              @(link_prefix="CG", default_calling_convention="c")
+              foreign lib {
+                  DisplayCreateUUIDFromDisplayID :: proc( displayID: DirectDisplayID ) -> CF.UUIDRef ---
+                  DisplayGetDisplayIDFromUUID :: proc( uuid: CF.UUIDRef ) -> DirectDisplayID ---
+              }
+          }
+
+
+      TypeMap:
+        NSObject: NSObject
+        MTLDevice: MTLDevice
+        _cl_device_id: cl_device_id
+        io_service_t: mach.port_t
+
+
+  # Symbol Transformers
+  EnumTransforms:
+  - Type: ^(CG).+
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: kCG
+  - Type: ^(CGPDF).+
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: PDF
+  - Type: .*
+    Transforms:
+    - Kind  : RemoveTypeWordsFromElements
+    - Kind  : RemovePartialTypeNamePrefix
+    - Kind  : RemoveUnderscorePrefix
+    - Kind  : UnderscoreNumbers
+
+  TypeTransforms:
+    - Type: ^(CG).+
+      Transforms:
+      - Kind  : RemovePrefix
+        Source: $group0
+    - Type: Flag$ # Transforms for bit_set types
+      Transforms:
+      - Kind  : AppendSuffix
+        Source: s
+    - Type: Mask$
+      Transforms:
+      - Kind  : None
+
+  BitSetMap:
+    - Type: Flags?$
+      Transforms:
+        - Kind  : RemoveSuffix
+          Source: s
+    - Type: Mask$
+      Transforms:
+        - Kind  : AppendSuffix
+          Source: Flag
+ 
+  ProcTransforms:
+  - Type: ^(_*CG).+
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: $group0
+
+  VarTransforms:
+    - Type: ^(_*k?CG).+
+      Transforms:
+        - Kind  : RemovePrefix
+          Source: $group0

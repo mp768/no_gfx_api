@@ -1,0 +1,83 @@
+package darwodin_NSURLQueryItem_Ext
+
+import "base:intrinsics"
+import "base:runtime"
+import cffi "core:c"
+import ObjC "../../../ObjectiveC"
+import libc "../libc"
+import CF "../../../CoreFoundation"
+import CG "../../../CoreGraphics"
+import Sec "../../../Security"
+
+object_getIndexedIvars :: ObjC.object_getIndexedIvars
+class_addMethod        :: ObjC.class_addMethod
+msgSend                :: intrinsics.objc_send
+
+id            :: ^intrinsics.objc_object
+SEL           :: ^intrinsics.objc_selector
+Class         :: ^intrinsics.objc_class
+IMP           :: rawptr
+Protocol      :: distinct id
+instancetype  :: intrinsics.objc_instancetype
+
+import NS "../../"
+
+import "../NSObject"
+
+VTable :: struct {
+    super: NSObject.VTable,
+    initWithName: proc(self: ^NS.URLQueryItem, name: ^NS.String, value: ^NS.String) -> instancetype,
+    queryItemWithName: proc(name: ^NS.String, value: ^NS.String) -> instancetype,
+    name: proc(self: ^NS.URLQueryItem) -> ^NS.String,
+    value: proc(self: ^NS.URLQueryItem) -> ^NS.String,
+}
+
+extend :: proc(cls: Class, vt: ^VTable) {
+    assert(vt != nil);
+    meta := ObjC.object_getClass(auto_cast cls)
+    _=meta
+    
+    NSObject.extend(cls, &vt.super)
+
+    if vt.initWithName != nil {
+        initWithName :: proc "c" (self: ^NS.URLQueryItem, _: SEL, name: ^NS.String, value: ^NS.String) -> instancetype {
+
+            vt_ctx := ObjC.object_get_vtable_info(self)
+            context = vt_ctx._context
+            return (cast(^VTable)vt_ctx.super_vt).initWithName(self, name, value)
+        }
+
+        if !class_addMethod(cls, intrinsics.objc_find_selector("initWithName:value:"), auto_cast initWithName, "@@:@@") do panic("Failed to register objC method.")
+    }
+    if vt.queryItemWithName != nil {
+        queryItemWithName :: proc "c" (self: Class, _: SEL, name: ^NS.String, value: ^NS.String) -> instancetype {
+
+            vt_ctx := ObjC.class_get_vtable_info(self)
+            context = vt_ctx._context
+            return (cast(^VTable)vt_ctx.super_vt).queryItemWithName( name, value)
+        }
+
+        if !class_addMethod(meta, intrinsics.objc_find_selector("queryItemWithName:value:"), auto_cast queryItemWithName, "@#:@@") do panic("Failed to register objC method.")
+    }
+    if vt.name != nil {
+        name :: proc "c" (self: ^NS.URLQueryItem, _: SEL) -> ^NS.String {
+
+            vt_ctx := ObjC.object_get_vtable_info(self)
+            context = vt_ctx._context
+            return (cast(^VTable)vt_ctx.super_vt).name(self)
+        }
+
+        if !class_addMethod(cls, intrinsics.objc_find_selector("name"), auto_cast name, "@@:") do panic("Failed to register objC method.")
+    }
+    if vt.value != nil {
+        value :: proc "c" (self: ^NS.URLQueryItem, _: SEL) -> ^NS.String {
+
+            vt_ctx := ObjC.object_get_vtable_info(self)
+            context = vt_ctx._context
+            return (cast(^VTable)vt_ctx.super_vt).value(self)
+        }
+
+        if !class_addMethod(cls, intrinsics.objc_find_selector("value"), auto_cast value, "@@:") do panic("Failed to register objC method.")
+    }
+}
+

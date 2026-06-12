@@ -1,0 +1,191 @@
+---
+
+Defs: ../definitions/macos/foundation.json
+
+Mono  : { Emit: false }
+CSharp: { Emit: false }
+
+Cpp:
+  Emit: false
+  ExportInternals: true
+  DontWrapCFunctions: true
+  ExportForwardDeclarations: true
+  
+  ExportTypes:
+    - ^_*NS.+
+    - ^.*GrafP
+    - ^_?xpc_.+
+    - ^unichar
+    - ^(Opaque)?AE.+
+    - ^AppleEvent
+    - ^DescType
+    - ^au_asid_t
+    - ^AE.+
+
+
+  ExportMethods:
+    - ^::NS.+
+
+  ExportVars:
+    - ^::k?NS.+
+
+  IgnoreTypes:
+    - ^NSImage$
+
+  IgnoreMethods: []
+
+Odin:
+  Emit             : true
+  ExportPath       : ..
+  BasePackageName  : darwodin
+  SingleFile       : false
+  EmitObjCExtenders: true
+  TargetPlatform   : Darwin
+  ExportTypeMapDir : ../exports
+
+  ExternalTypes:
+    - ../exports/global.exports.yml
+    - ../libc/libc.exports.yml
+    - ../exports/CoreFoundation.exports.yml
+    - ../exports/CoreGraphics.exports.yml
+    - ../exports/Security.exports.yml
+
+  ExternalPackageMap:
+    darwin_libc: '../libc'
+
+  NonDistinctTypeDefs:
+    - ^NSRange$
+    - ^NSZone$
+    - ^unichar$
+    - ^Integer$
+    - ^UInteger$
+
+  ResolvedTypedefs:
+    - '[su]?int.*'
+
+  Packages:
+    - Name  : Foundation
+      Export: NS
+      DarwinLinkLibs: [system:Foundation.framework]
+      RequiredLink: true
+      Filter: .*
+
+      Imports:
+        - |
+          OpaqueSecTransformImplementation :: struct {}
+          OpaqueSecIdentitySearchRef       :: struct {}
+          OpaquePolicySearchRef            :: struct {}
+
+          to_ns_string :: #force_inline proc "contextless" ( str: string ) -> ^String {
+              return String.alloc()->initWithBytes(raw_data(str), UInteger(len(str)), UTF8StringEncoding)
+          }
+
+          to_ns_string_no_copy :: #force_inline proc "contextless" ( str: string ) -> ^String {
+              return String.alloc()->initWithBytesNoCopy(raw_data(str), UInteger(len(str)), UTF8StringEncoding, false)
+          }
+
+          to_odin_string :: proc( ns_str: ^String, allocator := context.allocator ) -> string {
+              length := ns_str->lengthOfBytesUsingEncoding(UTF8StringEncoding)
+              dest := make([]u8, int(length)+1, allocator)
+
+              runtime.mem_copy_non_overlapping(raw_data(dest), rawptr(ns_str->UTF8String()), int(length))
+              return string(dest[:length])
+          }
+
+          tmp_to_odin_string :: #force_inline proc ( ns_str: ^String ) -> string {
+              return to_odin_string(ns_str, context.temp_allocator)
+          }
+
+          // Helper array iterator
+          Array_Iterator :: struct($T: typeid) {
+              array: ^Array,
+              length: int,
+              index:  int,
+          }
+
+          array_iter :: proc( $T: typeid, array: ^Array ) -> Array_Iterator(T) {
+              return Array_Iterator(T) {
+                  array  = array,
+                  length = int(array->count()),
+                  index  = 0,
+              }
+          }
+
+          array_next :: proc( it: ^Array_Iterator($T) ) -> (val: ^T, idx: int, cond: bool) {
+              if it.index >= it.length {
+                  return
+              }
+
+              val      = auto_cast it.array->objectAtIndex(auto_cast it.index)
+              it.index += 1
+              cond     = true
+              return
+          }
+
+          STR :: #force_inline proc "contextless" ( #const s: cstring ) -> ^String {
+              return auto_cast CF.STR(s)
+          }
+
+
+      # TypeMap:
+
+
+  # Symbol Transformers
+  EnumTransforms:
+  - Type: .*
+    Transforms:
+    - Kind  : RemoveTypeWordsFromElements
+    - Kind  : RemovePartialTypeNamePrefix
+    - Kind  : RemoveUnderscorePrefix
+    - Kind  : UnderscoreNumbers
+    
+  - Type: ^CE_GeneralNameType$
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: GNT_
+
+  - Type: ^CE_DataType$
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: DT_
+
+  - Type: ^CE_CrlDistributionPointNameType$
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: DNT_
+
+
+  TypeTransforms:
+    - Type: ^(NS).+
+      Transforms:
+      - Kind  : RemovePrefix
+        Source: $group0
+    - Type: Flag$ # Transforms for bit_set types
+      Transforms:
+      - Kind  : AppendSuffix
+        Source: s
+    - Type: Mask$
+      Transforms:
+      - Kind  : None
+
+  BitSetMap:
+    - Type: Flags?$
+      Transforms:
+        - Kind  : RemoveSuffix
+          Source: s
+    - Type: Mask$
+      Transforms:
+        - Kind  : AppendSuffix
+          Source: Flag
+
+  ProcTransforms:
+  - Type: ^(_*NS).+
+    Transforms:
+    - Kind  : RemovePrefix
+      Source: $group0
+
+  VarTransforms:
+    - Type: ^(_*k?NS).+
+      Transforms:
+        - Kind  : RemovePrefix
+          Source: $group0
