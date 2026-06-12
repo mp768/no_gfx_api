@@ -1,4 +1,4 @@
-
+#+build !darwin
 package gpu
 
 import vk "vendor:vulkan"

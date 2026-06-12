@@ -11,7 +11,7 @@ import mem "core:mem"
 import "core:math"
 
 import sdl "vendor:sdl3"
-import vk "vendor:vulkan"
+// import vk "vendor:vulkan"
 
 // This API follows the ZII (Zero Is Initialization) principle. Initializing to 0
 // will yield predictable and reasonable behavior in general.
@@ -294,7 +294,7 @@ Device_Limits :: struct
 init: proc(validation := true, loc := #caller_location) -> bool : _init
 cleanup: proc(loc := #caller_location) : _cleanup
 wait_idle: proc() : _wait_idle
-swapchain_init: proc(surface: vk.SurfaceKHR, init_size: [2]u32, frames_in_flight: u32) : _swapchain_init
+swapchain_init: proc(surface: rawptr, init_size: [2]u32, frames_in_flight: u32) : _swapchain_init
 swapchain_resize: proc(size: [2]u32) : _swapchain_resize  // NOTE: Do not call this every frame! Only if the dimensions change.
 swapchain_acquire_next: proc() -> Texture : _swapchain_acquire_next  // Blocks CPU until at least one frame is available.
 swapchain_present: proc(queue: Queue, sem_wait: Semaphore, wait_value: u64) : _swapchain_present
@@ -741,14 +741,22 @@ bvh_alloc_build_scratch_buffer :: proc { blas_alloc_build_scratch_buffer, tlas_a
 
 swapchain_init_from_sdl :: proc(window: ^sdl.Window, frames_in_flight: u32)
 {
-    vk_surface: vk.SurfaceKHR
-    ok := sdl.Vulkan_CreateSurface(window, vk_get_instance(), nil, &vk_surface)
-    ensure(ok, "Could not create surface.")
+    surface: rawptr = nil;
+
+    when ODIN_OS != .Darwin {
+        vk_surface: vk.SurfaceKHR
+        ok := sdl.Vulkan_CreateSurface(window, vk_get_instance(), nil, &vk_surface)
+        ensure(ok, "Could not create surface.")
+
+        surface = &vk_surface
+    } else {
+        // TODO: Implement metal variant.
+    }
 
     window_size_x: i32
     window_size_y: i32
     sdl.GetWindowSize(window, &window_size_x, &window_size_y)
-    swapchain_init(vk_surface, { u32(max(0, window_size_x)), u32(max(0, window_size_y)) }, frames_in_flight)
+    swapchain_init(surface, { u32(max(0, window_size_x)), u32(max(0, window_size_y)) }, frames_in_flight)
 }
 
 // Texture utils
