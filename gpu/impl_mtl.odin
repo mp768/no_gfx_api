@@ -169,9 +169,10 @@ Queue_Info :: struct
 
 @(private="file")
 Shader_Info :: struct {
-    handle: vk.ShaderEXT,
+    handle: ^mtl.MTL4LibraryFunctionDescriptor,
     current_workgroup_size: [3]u32,
     is_compute: bool,
+    graphics_type: Shader_Type_Graphics,
 }
 
 @(private="file")
@@ -235,7 +236,7 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
     // If we want to do proper `bindless` rendering techniques, we need our 
     // argument buffers to be tier 2.
     ensure((ctx.device)->argumentBuffersSupport() == ._2, "Tier 2 Argument Buffer support is expected for 'no_gfx' on the Metal Backend")
-
+    
     ensure((ctx.device)->readWriteTextureSupport() == ._2, "Tier 2 read/write texture support is epxected for 'no_gfx' on the Metal Backend")
 
     // Set random initial capacity (need a better metric for this later...)
@@ -744,6 +745,12 @@ _mem_alloc_raw :: proc(#any_int el_size, #any_int el_count, #any_int align: i64,
     // Append to residency set!
     if sync.guard(&ctx.lock) {
         (ctx.allocation_set)->addAllocation(buf)
+        // NOTE(MP): Doing this for *every* allocation is probably a bad idea
+        // for performance, but for simplicity, this should work fine...
+        // 
+        // We'll likely have to find a place where we could sync the residency
+        // set at, but I don't want to think about that for a while.
+        (ctx.allocation_set)->commit()
     }
     
     p: ptr
@@ -899,25 +906,6 @@ _texture_destroy :: proc(texture: Texture, loc := #caller_location)
 }
 
 @(private="file")
-get_or_add_image_view :: proc(texture: Texture_Handle, info: vk.ImageViewCreateInfo) -> vk.ImageView
-{
-    tex_info, r_lock := pool_get_mut(&ctx.textures, texture); sync.guard(r_lock)
-
-    for view in tex_info.views
-    {
-        if view.info == info {
-            return view.view
-        }
-    }
-
-    image_view: vk.ImageView
-    view_ci := info
-    vk_check(vk.CreateImageView(ctx.device, &view_ci, nil, &image_view))
-    append(&tex_info.views, Image_View_Info { info, image_view })
-    return image_view
-}
-
-@(private="file")
 get_or_add_sampler :: proc(info: Sampler_Desc) -> ^mtl.SamplerState
 {
     tls := get_tls()
@@ -965,7 +953,7 @@ _texture_descriptor :: proc(texture: Texture, view_desc: Texture_View_Desc, loc 
     tex_info := pool_get(&ctx.textures, texture.handle)
 
     desc: Texture_Descriptor
-    desc[0] = transmute(u64)((tex_info.handle)->gpuResourceID())
+    desc[0] = u64(uintptr(tex_info.handle))
 
     return desc
 }
@@ -995,7 +983,7 @@ _sampler_descriptor :: proc(sampler_desc: Sampler_Desc, loc := #caller_location)
 
     sampler := get_or_add_sampler(sampler_desc)
 
-    return transmute(Sampler_Descriptor) (sampler->gpuResourceID())
+    return Sampler_Descriptor(sampler)
 }
 
 _desc_heap_create :: proc(texture_count: u32 = 65536,
@@ -1061,6 +1049,8 @@ _desc_heap_destroy :: proc(heap: Descriptor_Heap, loc := #caller_location)
 
     heap_info := pool_get(&ctx.desc_heaps, heap)
 
+    (heap_info.residency_set)->endResidency()
+
     (heap_info.residency_set)->release()
     (heap_info.textures)->release()
     (heap_info.textures_rw)->release()
@@ -1088,8 +1078,12 @@ _desc_heap_set_textures :: proc(heap: Descriptor_Heap, start_idx: u32, textures:
     texture_ids: []mtl.ResourceID = make([]mtl.ResourceID, len(textures), allocator = scratch)
     for &id, i in texture_ids
     {
+        texture := (^mtl.Texture)(uintptr(textures[i][0]))
+
+        (heap_info.residency_set)->addAllocation(texture)
+        
         // Get the resource id from the descriptor
-        id = transmute(mtl.ResourceID)u64(textures[i][0])
+        id = texture->gpuResourceID()
     }
 
     heap_textures := cast([^]mtl.ResourceID)(heap_info.textures)->contents()
@@ -1116,8 +1110,12 @@ _desc_heap_set_textures_rw :: proc(heap: Descriptor_Heap, start_idx: u32, textur
     texture_ids: []mtl.ResourceID = make([]mtl.ResourceID, len(textures), allocator = scratch)
     for &id, i in texture_ids
     {
+        texture := (^mtl.Texture)(uintptr(textures[i][0]))
+
+        (heap_info.residency_set)->addAllocation(texture)
+        
         // Get the resource id from the descriptor
-        id = transmute(mtl.ResourceID)u64(textures[i][0])
+        id = texture->gpuResourceID()
     }
 
     heap_textures_rw := cast([^]mtl.ResourceID)(heap_info.textures_rw)->contents()
@@ -1144,8 +1142,10 @@ _desc_heap_set_samplers :: proc(heap: Descriptor_Heap, start_idx: u32, samplers:
     sampler_ids: []mtl.ResourceID = make([]mtl.ResourceID, len(samplers), allocator = scratch)
     for &id, i in sampler_ids
     {
+        sampler := (^mtl.SamplerState)(samplers[i])
+        
         // Get the resource id from the descriptor
-        id = transmute(mtl.ResourceID)u64(samplers[i])
+        id = sampler->gpuResourceID()
     }
 
     heap_samplers := cast([^]mtl.ResourceID)(heap_info.samplers)->contents()
@@ -1197,6 +1197,29 @@ _desc_heap_set_bvhs :: proc(heap: Descriptor_Heap, start_idx: u32, bvhs: []BVH, 
 @(private="file")
 _shader_create_internal :: proc(code: []u32, is_compute: bool, vk_stage: vk.ShaderStageFlags, entry_point_name := "main", group_size_x: u32 = 1, group_size_y: u32 = 1, group_size_z: u32 = 1, name: string, loc: runtime.Source_Code_Location) -> Shader
 {
+    /*
+        NOTE:
+        - We'll make use of the method 'reflectionForFunctionWithName' to get 
+          a 'MTLFunctionReflection' variable, which then we'll get bindings
+          from (which are of type '[]^mtl.Binding' data-wise).
+        - We'll then look through each binding, check if the name matches
+          one located in the set of known names for each type, record the binding
+          index and then we'll use that to inform the descriptor heap where to bind
+          the buffers to (so that each 'distinct' texture heap gets aliased to the
+          same buffer)
+        - Once we've recorded the indices where these buffers get bound, we can
+          then apply them when a 'draw' or 'dispatch' command is called, in tandem
+          with the descriptor heap given to the current command buffer. We'll also
+          most likely cache these indirections such that we don't need to consistently
+          append arguments to ArgumentTable's for subsequent calls and/or every
+          frame, since it's unlikely to change.
+
+
+        - Additionally, we should know the push constant names, so we could 
+        search for them through reflection (but we could also make the assumption
+        that they'll always be buffer index 0)
+    */
+    
     push_constant_ranges: []vk.PushConstantRange
     if is_compute {
         push_constant_ranges = []vk.PushConstantRange {
