@@ -18,6 +18,11 @@ import ns "darwodin/Foundation"
 import cf "darwodin/CoreFoundation"
 import cg "darwodin/CoreGraphics"
 
+// NOTE: We don't really need this dependency. It is only here to 
+// supply a hacky solution, so once that hack is gone, this will
+// disappear as well.
+import "core:unicode/utf8"
+
 @(private="file")
 Max_Textures :: 65536
 @(private="file")
@@ -45,6 +50,42 @@ Compute_Shader_Push_Constants :: struct #packed {
     compute_data: rawptr,
 }
 
+/*
+    NOTE: Metal doesn't support aliased shader buffers the same way spirv
+    does, at least not directly. However, we can hack together something
+    that operates similar to that model, by simply making several distinct
+    buffers on the shader side and then binding all of them to the same
+    buffer address through the CPU calls. Each buffer then will become a
+    simple typed-container for determining how to interpret the data in
+    the shared buffer given to them.
+*/
+
+@(private="file")
+Shader_Texture_Descriptor_Indices := [?]ns.UInteger {
+    1, // 2DHeap
+    2, // 1DHeap
+    3, // 3DHeap
+    4, // CubeHeap
+    5, // 2DArrayHeap
+    6, // CubeArrayHeap
+    7, // 1DArrayHeap
+}
+
+@(private="file")
+Shader_Texture_RW_Descriptor_Indices := [?]ns.UInteger {
+    8,  // 2DHeapRW
+    9,  // 1DHeapRW
+    10, // 3DHeapRW
+    11, // 2DArrayHeapRW
+    12, // 1DArrayHeapRW
+}
+
+@(private="file")
+Shader_Sampler_Descriptor_Index : ns.UInteger : 13
+
+@(private="file")
+Shader_BVH_Descriptor_Index : ns.UInteger : 14
+
 @(private="file")
 Alloc_Handle :: distinct Handle
 
@@ -54,18 +95,11 @@ Context :: struct
     validation: bool,
     features: Features,
 
-    device: ^mtl.Device,
-
-    layer: ^ca.MetalLayer,
-    
-    physical_properties: Physical_Properties,
-
-    allocation_set: ^mtl.ResidencySet,
-
     // Common resources
-    desc_layouts: [dynamic]vk.DescriptorSetLayout,
-    common_pipeline_layout_graphics: vk.PipelineLayout,
-    common_pipeline_layout_compute: vk.PipelineLayout,
+    device: ^mtl.Device,    
+    physical_properties: Physical_Properties,
+    allocation_set: ^mtl.ResidencySet,
+    shader_compiler: ^mtl.MTL4Compiler,
 
     // Resource pools
     allocs: Resource_Pool(Alloc_Handle, Alloc_Info),
@@ -107,19 +141,26 @@ Thread_Local_Context :: struct
 @(private="file")
 Physical_Properties :: struct
 {
-    bvh_props: vk.PhysicalDeviceAccelerationStructurePropertiesKHR,
-    props2: vk.PhysicalDeviceProperties2,
+    // TODO: Figure out what information may be relevant in the case of 
+    // raytracing on metal...
+
+    // bvh_props: vk.PhysicalDeviceAccelerationStructurePropertiesKHR,
+    // props2: vk.PhysicalDeviceProperties2,
 }
 
 @(private="file")
 BVH_Info :: struct
 {
+    // TODO: Figure out what may be relevant for raytracing on metal...
+    
+    /*
     handle: vk.AccelerationStructureKHR,
     mem: rawptr,
     is_blas: bool,
     shapes: [dynamic]BVH_Shape_Desc,  // Only used if BLAS.
     blas_desc: BLAS_Desc,
     tlas_desc: TLAS_Desc,
+    */
 }
 
 @(private="file")
@@ -146,25 +187,10 @@ Texture_Info :: struct
 }
 
 @(private="file")
-Image_View_Info :: struct
-{
-    info: vk.ImageViewCreateInfo,
-    view: vk.ImageView,
-}
-
-@(private="file")
 Sampler_Info :: struct
 {
     info: Sampler_Desc,
     sampler: ^mtl.SamplerState,
-}
-
-@(private="file")
-Queue_Info :: struct
-{
-    handle: vk.Queue,
-    family_idx: u32,
-    queue_idx: u32,
 }
 
 @(private="file")
@@ -237,7 +263,7 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
     // argument buffers to be tier 2.
     ensure((ctx.device)->argumentBuffersSupport() == ._2, "Tier 2 Argument Buffer support is expected for 'no_gfx' on the Metal Backend")
     
-    ensure((ctx.device)->readWriteTextureSupport() == ._2, "Tier 2 read/write texture support is epxected for 'no_gfx' on the Metal Backend")
+    ensure((ctx.device)->readWriteTextureSupport() == ._2, "Tier 2 read/write texture support is expected for 'no_gfx' on the Metal Backend")
 
     // Set random initial capacity (need a better metric for this later...)
     ctx.allocation_set = mtl_create_residency_set(32, "allocation")
@@ -254,10 +280,12 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
         ctx.queues[queue] = mtl4_queue
     }
 
-    // TODO: Implement this...
-    // Set up queue specific semaphores.
+    // Set up queue specific semaphores for command buffers.
     #unroll for queue in Queue {
-        
+        ctx.cmd_bufs_sem_vals[queue] = {
+            sem = semaphore_create(0),
+            val = 0,
+        }
     }
 
     // TODO: Implement logic relating to raytracing support beyond the following...
@@ -274,7 +302,17 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
     pool_init(&ctx.semaphores)
     pool_init(&ctx.desc_heaps)
 
-    
+    // Initialize the new MTL4 Compiler that handles compiling shaders
+    // for the render and compute pipelines. (Although, this is probably 
+    // a bad description for what this really is)
+    {
+        compiler_desc: ^mtl.MTL4CompilerDescriptor = (mtl.MTL4CompilerDescriptor{})->alloc()
+        defer compiler_desc->release()
+
+        err: ^ns.Error
+        ctx.shader_compiler = (ctx.device)->newCompilerWithDescriptor(compiler_desc, &err)
+        mtl_ensure(err, "Unable to initialize MTL4Compiler!\n")
+    }
 
     /*
         NOTE:
@@ -328,16 +366,10 @@ mtl_create_residency_set :: proc(initial_capacity: u32, $set_type: string) -> ^m
     set: ^mtl.ResidencySet
 
     {
-        error: ^ns.Error
+        err: ^ns.Error
         set = (ctx.device)->newResidencySetWithDescriptor(set_desc, &error)
 
-        if error != nil {
-            objc_str := error->localizedFailureReason()
-            err_str := string(objc_str->UTF8String())
-
-            log.fatalf("Failed to create " + set_type + " residency set for metal backend. Reason: %v", err_str)
-            return nil;
-        }
+        mtl_ensure(err, "Failed to create " + set_type + " residency set for metal backend.\n")
     }
 
     return set
@@ -555,6 +587,8 @@ _swapchain_acquire_next :: proc() -> Texture
 
     // TODO: Handle the 'format' present on the texture to account for 
     // possible different pixel formats for the 'swapchain'
+    // 
+    // Likely will need a helper method to convert `mtl.PixelFormat` -> `Texture_Format`
     
     return Texture {
         type = .D2,
@@ -1195,148 +1229,66 @@ _desc_heap_set_bvhs :: proc(heap: Descriptor_Heap, start_idx: u32, bvhs: []BVH, 
 
 // Shaders
 @(private="file")
-_shader_create_internal :: proc(code: []u32, is_compute: bool, vk_stage: vk.ShaderStageFlags, entry_point_name := "main", group_size_x: u32 = 1, group_size_y: u32 = 1, group_size_z: u32 = 1, name: string, loc: runtime.Source_Code_Location) -> Shader
+_shader_create_internal :: proc(code: []u32, is_compute: bool, graphics_stage: Shader_Type_Graphics, entry_point_name := "main", group_size_x: u32 = 1, group_size_y: u32 = 1, group_size_z: u32 = 1, name: string, loc: runtime.Source_Code_Location) -> Shader
 {
-    /*
-        NOTE:
-        - We'll make use of the method 'reflectionForFunctionWithName' to get 
-          a 'MTLFunctionReflection' variable, which then we'll get bindings
-          from (which are of type '[]^mtl.Binding' data-wise).
-        - We'll then look through each binding, check if the name matches
-          one located in the set of known names for each type, record the binding
-          index and then we'll use that to inform the descriptor heap where to bind
-          the buffers to (so that each 'distinct' texture heap gets aliased to the
-          same buffer)
-        - Once we've recorded the indices where these buffers get bound, we can
-          then apply them when a 'draw' or 'dispatch' command is called, in tandem
-          with the descriptor heap given to the current command buffer. We'll also
-          most likely cache these indirections such that we don't need to consistently
-          append arguments to ArgumentTable's for subsequent calls and/or every
-          frame, since it's unlikely to change.
+    // TODO: Implement a better way of handling shader source input for both
+    // metal and vulkan backends. 
+    // 
+    // Right now, this is just a hack to avoid messing with the API boundary
+    // and to afford quick testing as a result. I don't want to mess with the
+    // API because I don't feel like dealing with a potential merge conflict
+    // at this moment in time...
+    source_runes := transmute([]rune)code
+    source := utf8.runes_to_string(source_runes)
+    defer delete(source)
 
+    // TODO: Implement a hash table of sorts to cache libraries coming from
+    // the same source code to prevent us compiling the same library code
+    // multiple times. Use something like SHA256 for the hash.
 
-        - Additionally, we should know the push constant names, so we could 
-        search for them through reflection (but we could also make the assumption
-        that they'll always be buffer index 0)
-    */
+    library: ^mtl.Library
+    {
+        lib_desc: ^mtl.MTL4LibraryDescriptor = (mtl.MTL4LibraryDescriptor{})->alloc()
+        defer lib_desc->release()
     
-    push_constant_ranges: []vk.PushConstantRange
-    if is_compute {
-        push_constant_ranges = []vk.PushConstantRange {
-            {
-                stageFlags = { .COMPUTE },
-                size = size_of(Compute_Shader_Push_Constants),
-            }
-        }
-    } else {
-        push_constant_ranges = []vk.PushConstantRange {
-            {
-                stageFlags = { .VERTEX, .FRAGMENT },
-                size = size_of(Graphics_Shader_Push_Constants),
-            }
-        }
+        source_objc := to_mtl_string(source)
+        defer source_objc->release()
+        
+        lib_desc->setSource(source_objc)
+
+        err: ^ns.Error
+        library = (ctx.shader_compiler)->newLibraryWithDescriptor_error(lib_desc, &err)
+
+        mtl_ensure(err, "%v shader creation failed during library/source compilation.", "Compute" if is_compute else "Graphics")
     }
 
-    // Setup specialization constants for compute shader workgroup size
-    spec_map_entries: [3]vk.SpecializationMapEntry
-    spec_data: [3]u32
-    spec_info: vk.SpecializationInfo
-    spec_info_ptr: ^vk.SpecializationInfo = nil
-    spec_count: u32 = 0
+    shader: ^mtl.MTL4LibraryFunctionDescriptor = (mtl.MTL4LibraryFunctionDescriptor{})->alloc()
 
-    if is_compute
-    {
-        {
-            spec_map_entries[spec_count] = vk.SpecializationMapEntry {
-                constantID = 13370, // Random big ids to avoid conflicts with user defined constants
-                offset = u32(spec_count * size_of(u32)),
-                size = size_of(u32),
-            }
-            spec_data[spec_count] = group_size_x
-            spec_count += 1
-        }
+    shader->setLibrary(library)
 
-        {
-            spec_map_entries[spec_count] = vk.SpecializationMapEntry {
-                constantID = 13371, // Random big ids to avoid conflicts with user defined constants
-                offset = u32(spec_count * size_of(u32)),
-                size = size_of(u32),
-            }
-            spec_data[spec_count] = group_size_y
-            spec_count += 1
-        }
+    objc_entry_point_name := to_mtl_string(entry_point_name)
+    defer objc_entry_point_name->release()
 
-        {
-            spec_map_entries[spec_count] = vk.SpecializationMapEntry {
-                constantID = 13372, // Random big ids to avoid conflicts with user defined constants
-                offset = u32(spec_count * size_of(u32)),
-                size = size_of(u32),
-            }
-            spec_data[spec_count] = group_size_z
-            spec_count += 1
-        }
+    shader->setName(objc_entry_point_name)
+
+    si := Shader_Info {
+        handle = shader,
+        current_workgroup_size = { group_size_x, group_size_y, group_size_z },
+        is_compute = is_compute,
+        graphics_type = graphics_stage,
     }
 
-    if spec_count > 0
-    {
-        spec_info = vk.SpecializationInfo {
-            mapEntryCount = spec_count,
-            pMapEntries = raw_data(spec_map_entries[:spec_count]),
-            dataSize = int(spec_count * size_of(u32)),
-            pData = raw_data(spec_data[:spec_count]),
-        }
-        spec_info_ptr = &spec_info
-    }
-
-    next_stage: vk.ShaderStageFlags
-    if is_compute {
-        next_stage = {}
-    } else if vk_stage == { .VERTEX } {
-        next_stage = { .FRAGMENT }
-    } else {
-        next_stage = {}
-    }
-
-    entry_point_name_cstr := strings.clone_to_cstring(entry_point_name)
-    defer delete(entry_point_name_cstr)
-
-    shader_cis := vk.ShaderCreateInfoEXT {
-        sType = .SHADER_CREATE_INFO_EXT,
-        codeType = .SPIRV,
-        codeSize = len(code) * size_of(code[0]),
-        pCode = raw_data(code),
-        pName = entry_point_name_cstr,
-        stage = vk_stage,
-        nextStage = next_stage,
-        pushConstantRangeCount = u32(len(push_constant_ranges)),
-        pPushConstantRanges = raw_data(push_constant_ranges),
-        setLayoutCount = u32(len(ctx.desc_layouts)),
-        pSetLayouts = raw_data(ctx.desc_layouts),
-        pSpecializationInfo = spec_info_ptr,
-    }
-
-    vk_shader: vk.ShaderEXT
-    vk_check(vk.CreateShadersEXT(ctx.device, 1, &shader_cis, nil, &vk_shader))
-
-    vk_set_debug_name(name, u64(vk_shader), .SHADER_EXT)
-
-    shader: Shader_Info
-    shader.handle = vk_shader
-    shader.current_workgroup_size = { group_size_x, group_size_y, group_size_z }
-    shader.is_compute = is_compute
-
-    return pool_add(&ctx.shaders, shader, { created_at = loc, name = name })
+    return pool_add(&ctx.shaders, si, { created_at = loc, name = name })
 }
 
 _shader_create :: proc(code: []u32, type: Shader_Type_Graphics, entry_point_name := "main", name := "", loc := #caller_location) -> Shader
 {
-    vk_stage := to_vk_shader_stage(type)
-    return _shader_create_internal(code, false, vk_stage, entry_point_name, name = name, loc = loc)
+    return _shader_create_internal(code, false, type, entry_point_name, name = name, loc = loc)
 }
 
 _shader_create_compute :: proc(code: []u32, group_size_x: u32, group_size_y: u32 = 1, group_size_z: u32 = 1, entry_point_name := "main", name := "", loc := #caller_location) -> Shader
 {
-    return _shader_create_internal(code, true, { .COMPUTE }, entry_point_name, group_size_x, group_size_y, group_size_z, name = name, loc = loc)
+    return _shader_create_internal(code, true, .Vertex, entry_point_name, group_size_x, group_size_y, group_size_z, name = name, loc = loc)
 }
 
 _shader_destroy :: proc(shader: Shader, loc := #caller_location)
@@ -1349,32 +1301,27 @@ _shader_destroy :: proc(shader: Shader, loc := #caller_location)
     }
 
     shader_info := pool_get(&ctx.shaders, shader)
-    vk_shader := shader_info.handle
-    vk.DestroyShaderEXT(ctx.device, vk_shader, nil)
-
+    mtl_shader := shader_info.handle
+    mtl_shader->release()
     pool_remove(&ctx.shaders, shader)
 }
 
 // Semaphores
 _semaphore_create :: proc(init_value: u64 = 0, name := "", loc := #caller_location) -> Semaphore
 {
-    next: rawptr
-    next = &vk.SemaphoreTypeCreateInfo {
-        sType = .SEMAPHORE_TYPE_CREATE_INFO,
-        pNext = next,
-        semaphoreType = .TIMELINE,
-        initialValue = init_value,
-    }
-    sem_ci := vk.SemaphoreCreateInfo {
-        sType = .SEMAPHORE_CREATE_INFO,
-        pNext = next
-    }
-    sem: vk.Semaphore
-    vk_check(vk.CreateSemaphore(ctx.device, &sem_ci, nil, &sem))
+    event := (ctx.device)->newSharedEvent()
 
-    vk_set_debug_name(name, u64(sem), .SEMAPHORE)
+    event->setSignaledValue(init_value)
 
-    return pool_add(&ctx.semaphores, sem, { name = name, created_at = loc })
+    if name != ""
+    {
+        objc_name := to_mtl_string(name)
+        defer objc_name->release()
+    
+        event->setLabel(objc_name)
+    }
+
+    return pool_add(&ctx.semaphores, event, { name = name, created })
 }
 
 _semaphore_get_value :: proc(sem: Semaphore, loc := #caller_location) -> u64
@@ -1386,10 +1333,9 @@ _semaphore_get_value :: proc(sem: Semaphore, loc := #caller_location) -> u64
         if !ok do return {}
     }
 
-    res: u64
-    vk_sem := pool_get(&ctx.semaphores, sem)
-    vk.GetSemaphoreCounterValue(ctx.device, vk_sem, &res)
-    return res
+    mtl_sem := pool_get(&ctx.semaphores, sem)
+
+    return u64(mtl_sem->signaledValue())
 }
 
 _semaphore_wait :: proc(sem: Semaphore, wait_value: u64, loc := #caller_location)
@@ -1401,15 +1347,9 @@ _semaphore_wait :: proc(sem: Semaphore, wait_value: u64, loc := #caller_location
         if !ok do return
     }
 
-    sems := []vk.Semaphore { pool_get(&ctx.semaphores, sem) }
-    values := []u64 { wait_value }
-    assert(len(sems) == len(values))
-    vk.WaitSemaphores(ctx.device, &{
-        sType = .SEMAPHORE_WAIT_INFO,
-        semaphoreCount = u32(len(sems)),
-        pSemaphores = raw_data(sems),
-        pValues = raw_data(values),
-    }, timeout = max(u64))
+    mtl_sem := pool_get(&ctx.semaphores, sem)
+
+    mtl_sem->waitUntilSignaledValue(wait_value, max(u64))
 }
 
 _semaphore_destroy :: proc(sem: Semaphore, loc := #caller_location)
@@ -1421,15 +1361,17 @@ _semaphore_destroy :: proc(sem: Semaphore, loc := #caller_location)
         if !ok do return
     }
 
-    vk_sem := pool_get(&ctx.semaphores, sem)
-    vk.DestroySemaphore(ctx.device, vk_sem, nil)
+    mtl_sem := pool_get(&ctx.semaphores, sem)
+    mtl_sem->release()
     pool_remove(&ctx.semaphores, sem)
 }
 
 // Raytracing
 _blas_size_and_align :: proc(desc: BLAS_Desc, loc := #caller_location) -> (size: u64, align: u64)
 {
-    return u64(get_vk_blas_size_info(desc).accelerationStructureSize), 16
+    // TODO(Raytracing)
+    return 0, 0
+    // return u64(get_vk_blas_size_info(desc).accelerationStructureSize), 16
 }
 
 _blas_create :: proc(desc: BLAS_Desc, storage: gpuptr, name := "", loc := #caller_location) -> BVH
@@ -1441,6 +1383,10 @@ _blas_create :: proc(desc: BLAS_Desc, storage: gpuptr, name := "", loc := #calle
         if !ok do return {}
     }
 
+    // TODO(Raytracing)
+    return {}
+
+    /*
     storage_buf, storage_offset, _ := get_buf_offset_from_gpu_ptr(storage)
     size_info := get_vk_blas_size_info(desc)
 
@@ -1467,16 +1413,21 @@ _blas_create :: proc(desc: BLAS_Desc, storage: gpuptr, name := "", loc := #calle
         blas_desc = desc,
     }
     return pool_add(&ctx.bvhs, bvh_info, { created_at = loc, name = name })
+    */
 }
 
 _blas_build_scratch_buffer_size_and_align :: proc(desc: BLAS_Desc, loc := #caller_location) -> (size: u64, align: u64)
 {
-    return u64(get_vk_blas_size_info(desc).buildScratchSize), u64(ctx.physical_properties.bvh_props.minAccelerationStructureScratchOffsetAlignment)
+    // TODO(Raytracing)
+    return 0, 0
+    // return u64(get_vk_blas_size_info(desc).buildScratchSize), u64(ctx.physical_properties.bvh_props.minAccelerationStructureScratchOffsetAlignment)
 }
 
 _tlas_size_and_align :: proc(desc: TLAS_Desc, loc := #caller_location) -> (size: u64, align: u64)
 {
-    return u64(get_vk_tlas_size_info(desc).accelerationStructureSize), 1
+    // TODO(Raytracing)
+    return 0, 0
+    // return u64(get_vk_tlas_size_info(desc).accelerationStructureSize), 1
 }
 
 _tlas_create :: proc(desc: TLAS_Desc, storage: gpuptr, name := "", loc := #caller_location) -> BVH
@@ -1488,6 +1439,10 @@ _tlas_create :: proc(desc: TLAS_Desc, storage: gpuptr, name := "", loc := #calle
         if !ok do return {}
     }
 
+    // TODO(Raytracing)
+    return {}
+
+    /*
     storage_buf, storage_offset, _ := get_buf_offset_from_gpu_ptr(storage)
     size_info := get_vk_tlas_size_info(desc)
 
@@ -1510,11 +1465,14 @@ _tlas_create :: proc(desc: TLAS_Desc, storage: gpuptr, name := "", loc := #calle
         tlas_desc = desc
     }
     return pool_add(&ctx.bvhs, bvh_info, { created_at = loc, name = name })
+    */
 }
 
 _tlas_build_scratch_buffer_size_and_align :: proc(desc: TLAS_Desc, loc := #caller_location) -> (size: u64, align: u64)
 {
-    return u64(get_vk_tlas_size_info(desc).buildScratchSize), u64(ctx.physical_properties.bvh_props.minAccelerationStructureScratchOffsetAlignment)
+    // TODO(Raytracing)
+    return 0, 0
+    // return u64(get_vk_tlas_size_info(desc).buildScratchSize), u64(ctx.physical_properties.bvh_props.minAccelerationStructureScratchOffsetAlignment)
 }
 
 _bvh_root_ptr :: proc(bvh: BVH, loc := #caller_location) -> rawptr
@@ -1526,12 +1484,17 @@ _bvh_root_ptr :: proc(bvh: BVH, loc := #caller_location) -> rawptr
         if !ok do return nil
     }
 
+    // TODO(Raytracing)
+    return nil
+
+    /*
     bvh_info := pool_get(&ctx.bvhs, bvh)
 
     return transmute(rawptr) vk.GetAccelerationStructureDeviceAddressKHR(ctx.device, & {
         sType = .ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
         accelerationStructure = bvh_info.handle
     })
+    */
 }
 
 _bvh_destroy :: proc(bvh: BVH, loc := #caller_location)
@@ -1543,11 +1506,15 @@ _bvh_destroy :: proc(bvh: BVH, loc := #caller_location)
         if !ok do return
     }
 
+    // TODO(Raytracing)
+    /*
     bvh_info := pool_get(&ctx.bvhs, bvh)
     vk.DestroyAccelerationStructureKHR(ctx.device, bvh_info.handle, nil)
     pool_remove(&ctx.bvhs, bvh)
+    */
 }
 
+/*
 @(private="file")
 get_vk_blas_size_info :: proc(desc: BLAS_Desc) -> vk.AccelerationStructureBuildSizesInfoKHR
 {
@@ -1582,11 +1549,32 @@ get_vk_tlas_size_info :: proc(desc: TLAS_Desc) -> vk.AccelerationStructureBuildS
     vk.GetAccelerationStructureBuildSizesKHR(ctx.device, .DEVICE, &build_info, &primitive_count, &size_info)
     return size_info
 }
+*/
 
 // Command buffer
 
 _queue_wait_idle :: proc(queue: Queue)
 {
+    sync.guard(&ctx.lock)
+
+    // TODO: Implement a basic semaphore lock here where it increments the
+    // counter, and encodes a signal on the queue, and finally waits on
+    // the semaphore until that signaled value is present.
+    // 
+    // h := create_semaphore(0)
+    // incr := 0 + 1
+    // 
+    // queue->signalEvent(h.sem, incr)
+    // 
+    // h->waitUntilSignaledValue(incr)
+    // 
+    // Something akin to the above
+    // 
+    // Then for the entire device, we could do the same thing, but with
+    // a loop across the all queues.
+    
+    tls_ctx := get_tls()
+
     if sync.guard(&ctx.lock) do vk.QueueWaitIdle(ctx.queues[queue].handle)
 }
 
@@ -2557,6 +2545,16 @@ _cmd_insert_debug_label :: proc(cmd_buf: Command_Buffer, name: string, color: [4
         pLabelName = name_cstr,
         color = color,
     })
+}
+
+@(private="file")
+mtl_ensure :: proc(err: ^ns.Error, msg := "", args: ..any, location := #caller_location)
+{
+    if err != nil {
+        objc_str := err->localizedFailureReason()
+        log.fatalf(msg, ..args, location = location)
+        fatal_error("Metal failure: %v", objc_str->UTF8String(), location = location)
+    }
 }
 
 @(private="file")

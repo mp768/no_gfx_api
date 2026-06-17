@@ -68,40 +68,6 @@ to_mtl_texture_format :: proc(format: Texture_Format) -> mtl.PixelFormat
     return .Invalid
 }
 
-mtl_helper_bytes_per_image :: proc(format: Texture_Format, dimensions: [3]u32) -> u64
-{  
-    // We don't need to calculate this for anything other than 3d images.
-    if dimensions.z <= 1
-    {
-        return 0
-    }
-    
-    switch format 
-    {
-        case .Default: panic("Implementation bug!")
-        case .RGBA8_Unorm, .BGRA8_Unorm, .RGBA8_SRGB: 
-            return size_of(u8) * 4 * dimensions.x * dimensions.y
-        case .D32_Float:
-            return size_of(f32) * 1 * dimensions.x * dimensions.y
-        case .RGBA16_Float: 
-            return size_of(f16) * 4 * dimensions.x * dimensions.y 
-        case .RGBA32_Float: 
-            return size_of(f32) * 4 * dimensions.x * dimensions.y
-
-        // NOTE(MP): Don't know enough to implement these.
-        case .BC1_RGBA_Unorm: panic("Bytes per image for BC1_RGBA_Unorm is unimplemented!")
-        case .BC3_RGBA_Unorm: panic("Bytes per image for BC3_RGBA_Unorm is unimplemented!")
-        case .BC7_RGBA_Unorm: panic("Bytes per image for BC7_RGBA_Unorm is unimplemented!")
-        case .ASTC_4x4_RGBA_Unorm: panic("Bytes per image for ASTC_4x4_RGBA_Unorm is unimplemented!")
-        case .ETC2_RGB8_Unorm: panic("Bytes per image for ETC2_RGB8_Unorm is unimplemented!")
-        case .ETC2_RGBA8_Unorm: panic("Bytes per image for ETC2_RGBA8_Unorm is unimplemented!")
-        case .EAC_R11_Unorm: panic("Bytes per image for EAC_R11_Unorm is unimplemented!")
-        case .EAC_RG11_Unorm: panic("Bytes per image for EAC_RG11_Unorm is unimplemented!")
-    }
-    
-    return 0
-}
-
 mtl_helper_dimensions_by_texture_format :: proc(format: Texture_Format, dimensions: [3]u32) -> [3]u32
 {
     switch format 
