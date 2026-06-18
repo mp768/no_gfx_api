@@ -112,6 +112,7 @@ Context :: struct
     desc_heaps: Resource_Pool(Descriptor_Heap, Descriptor_Heap_Info),
 
     cmd_bufs_sem_vals: [Queue]Semaphore_Value,
+    idle_queue_sem_vals: [Queue]Semaphore_Value,
 
     // Swapchain
     swapchain: Swapchain,
@@ -272,7 +273,8 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
     }
     
     // Set up individual queues for different tasks.
-    #unroll for queue in Queue {
+    #unroll for queue in Queue 
+    {
         mtl4_queue := (ctx.device)->newMTL4CommandQueue()
 
         mtl4_queue->addResidencySet(ctx.allocation_set)
@@ -280,9 +282,15 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
         ctx.queues[queue] = mtl4_queue
     }
 
-    // Set up queue specific semaphores for command buffers.
-    #unroll for queue in Queue {
+    // Set up queue specific semaphores for command buffers and idle procedures.
+    #unroll for queue in Queue 
+    {
         ctx.cmd_bufs_sem_vals[queue] = {
+            sem = semaphore_create(0),
+            val = 0,
+        }
+
+        ctx.idle_queue_sem_vals[queue] = {
             sem = semaphore_create(0),
             val = 0,
         }
@@ -513,11 +521,18 @@ _wait_idle :: proc()
 {
     sync.guard(&ctx.lock)
 
-    // TODO: Implement a "waitForEvent" call making use of something related 
-    // to queue submission (?)
-    // 
-    // I'm not sure how to effectively replicate the device wait idle in metal
-    // just yet.
+    #unroll for queue in Queue 
+    {
+        mtl_queue := ctx.queues[queue]
+        sem_val := &ctx.idle_queue_sem_vals[queue]
+        mtl_sem := pool_get(&ctx.semaphores, sem_val.sem)
+
+        sem_val.val += 1
+
+        mtl_queue->signalEvent(mtl_sem, sem_val.val)
+
+        mtl_sem->waitUntilSignaledValue(sem_val.val, max(u64))
+    }
 }
 
 _swapchain_init :: proc(_surface: rawptr, init_size: [2]u32, frames_in_flight: u32)
@@ -1557,25 +1572,16 @@ _queue_wait_idle :: proc(queue: Queue)
 {
     sync.guard(&ctx.lock)
 
-    // TODO: Implement a basic semaphore lock here where it increments the
-    // counter, and encodes a signal on the queue, and finally waits on
-    // the semaphore until that signaled value is present.
-    // 
-    // h := create_semaphore(0)
-    // incr := 0 + 1
-    // 
-    // queue->signalEvent(h.sem, incr)
-    // 
-    // h->waitUntilSignaledValue(incr)
-    // 
-    // Something akin to the above
-    // 
-    // Then for the entire device, we could do the same thing, but with
-    // a loop across the all queues.
+    mtl_queue := ctx.queues[queue]
     
-    tls_ctx := get_tls()
+    sem_val := &ctx.idle_queue_sem_vals[queue]
+    mtl_sem := pool_get(&ctx.semaphores, sem_val.sem)
 
-    if sync.guard(&ctx.lock) do vk.QueueWaitIdle(ctx.queues[queue].handle)
+    sem_val.val += 1
+
+    mtl_queue->signalEvent(mtl_sem, sem_val.val)
+
+    mtl_sem->waitUntilSignaledValue(sem_val.val, max(u64))
 }
 
 _commands_begin :: proc(queue: Queue, loc := #caller_location) -> Command_Buffer
@@ -2709,18 +2715,11 @@ destroy_swapchain :: proc(swapchain: ^Swapchain)
 @(private="file")
 Swapchain :: struct
 {
-    layer: ^ca.MetalLayer,
     acquired: bool,
+    layer: ^ca.MetalLayer,
 
     current_drawable: ^mtl.Drawable,
     current_texture_handle: ^mtl.Texture,
-    
-    handle: vk.SwapchainKHR,
-    width, height: u32,
-    images: []vk.Image,
-    texture_handles: []Texture_Handle,
-    image_views: []vk.ImageView,
-    present_semaphores: []vk.Semaphore,
 }
 
 @(private="file")
