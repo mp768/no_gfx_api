@@ -1,0 +1,294 @@
+---
+
+Defs: ../definitions/macos/corefoundation.json
+
+Mono  : { Emit: false }
+CSharp: { Emit: false }
+
+Cpp:
+  Emit: false
+  ExportInternals: true
+  DontWrapCFunctions: true
+  ExportForwardDeclarations: true
+
+  ExportTypes:
+    - ^_*CF.+
+    - ^_*dispatch_.+
+    - ^OSErr
+    - ^OSStatus
+    - ^LogicalAddress
+    - ^ConstLogicalAddress
+    - ^PhysicalAddress
+    - ^Ptr
+    - ^BytePtr
+    - ^ByteCount
+    - ^SignedByte
+    - ^ByteOffset
+    - ^Duration
+    - ^AbsoluteTime
+    - ^OptionBits
+    - ^ItemCount
+    - ^PBVersion
+    - ^ScriptCode
+    - ^LangCode
+    - ^RegionCode
+    - ^FourCharCode
+    - ^OSType
+    - ^ResType
+    - ^OSTypePtr
+    - ^ResTypePtr
+    - ^SRefCon
+    - ^IconRef
+    - ^OpaqueIconRef
+    - ^AppleEvent
+    - ^Handle
+    - ^Size
+    - ^UInt8
+    - ^SInt8
+    - ^UInt16
+    - ^SInt16
+    - ^UInt32
+    - ^SInt32
+    - ^UInt64
+    - ^SInt64
+    # - ^Boolean
+    # - ^boolean_t$
+    - ^UnicodeScalarValue;
+    - ^UTF32Char
+    - ^UniChar
+    - ^UTF16Char
+    - ^UTF8Char
+    - ^UniCharPtr
+    - ^UniCharCount
+    - ^UniCharCountPtr
+    - ^Str255
+    - ^Str63
+    - ^Str32
+    - ^Str31
+    - ^Str27
+    - ^Str15
+    - ^Bit
+    - ^StrFileName
+    - ^StringPtr
+    - ^StringHandle
+    - ^ConstStringPtr
+    - ^ConstStr255Param
+    - ^ConstStr63Param
+    - ^ConstStr32Param
+    - ^ConstStr31Param
+    - ^ConstStr27Param
+    - ^ConstStr15Param
+    - ^ConstStrFileNameParam
+    - ^UnsignedWide
+    - ^uext_object_t
+    - ^unichar
+    - ^[Oo][Ss]_
+    - ^_opaque_
+    - ^__mbstate_t
+    - ^qos_class_t$
+
+
+  ExportMethods:
+    - ^::CF.+
+    - ^::dispatch_.+
+    - ^::Sec.+
+
+  ExportVars:
+    - ^::k?CF.+
+    - ^::k?[Oo][Ss].+
+    - ^::k?Dispatch.+
+    - ^::k?dispatch.+
+    - ^::DISPATCH.+
+
+  IgnoreTypes  :
+    - ^OS_object$
+    - ^OS_os_workgroup
+    - ^OS_dispatch
+    - ^CFStringEncoding$
+
+  # IgnoreMethods:
+    # - ^::CFStringGetBytes # Conflicts with sys/darwin/core_foundation
+
+
+Odin:
+  Emit           : true
+  ExportPath     : ..
+  BasePackageName: darwodin
+  SingleFile     : false
+  TargetPlatform : Darwin
+  ExportTypeMapDir: ../exports
+
+  ExternalTypes:
+    - ../mach/exports/mach.exports.yml
+    - ../libc/libc.exports.yml
+
+  ExternalPackageMap:
+    darwin_libc: '../libc'
+
+  NoDistinctTypedefs: true
+  # DistinctTypeDefs:  
+  #   - 
+
+  # NonDistinctTypeDefs:
+  #   - ^.+Ref$
+
+  ResolvedTypedefs:
+    # - ^boolean_t$
+    - ^qos_class_t$
+    - CSSM_.+
+    - cssm_.+
+    - '[su]?int.*'
+
+  Packages:
+    - Name  : CoreFoundation
+      Filter: .*
+      Export: CF
+      DarwinLinkLibs: [system:CoreFoundation.framework]
+      RequiredLink: true
+
+      Imports:
+        - |
+          FSRef             :: struct {}
+          NSObject          :: intrinsics.objc_object
+          NSString          :: NSObject
+          NSMethodSignature :: NSObject
+          OS_object         :: NSObject
+          OS_os_workgroup   :: NSObject
+          NSUInteger        :: cffi.ulong
+          _NSZone           :: struct {}
+          Boolean           :: b8
+          boolean_t         :: b32
+
+
+          KERN_SUCCESS            :: 0
+          DISPATCH_TIME_NOW       :: 0
+          DISPATCH_TIME_FOREVER   :: 0xFFFFFFFFFFFFFFFF
+
+          @(default_calling_convention="c")
+          foreign lib {
+              @(link_name = "__CFStringMakeConstantString")
+              StringMakeConstantString :: proc "c" ( c: cstring ) -> StringRef ---
+          }
+
+          STR :: StringMakeConstantString
+
+          StringCopyToOdinString :: proc( theString: StringRef, allocator := context.allocator ) -> (str: string, ok: bool) #optional_ok {
+              length := StringGetLength(theString)
+              max    := StringGetMaximumSizeForEncoding(length, StringEncoding(StringBuiltInEncodings.UTF8))
+
+              buf, err := make([]byte, max, allocator)
+              if err != nil {
+                  return
+              }
+
+              n: Index
+              StringGetBytes(theString, {0, length}, StringEncoding(StringBuiltInEncodings.UTF8), 0, false, raw_data(buf), Index(len(buf)), &n)
+              return string(buf[:n]), true
+          }
+
+
+
+      TypeMap:
+        NSObject:          NSObject
+        NSMethodSignature: NSMethodSignature
+        NSString:          NSString
+        NSUInteger:        NSUInteger
+        _NSZone:           _NSZone
+        OS_object:         OS_object
+        OS_os_workgroup:   OS_os_workgroup
+        Boolean:           Boolean
+        CFStringEncoding:  StringEncoding
+
+      # ExternalTypes:
+
+
+  # Symbol Transformers
+  EnumTransforms:
+  - Type: ^CFURLBookmarkResolutionOptions$
+    Transforms:
+    - Kind  : ReplacePrefix
+      Source: kCFBookmarkResolution
+      Target: _k
+  
+  - Type: ^(CFURL|CFXML).+
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: k
+      - Kind  : RemovePrefix
+        Source: CFBookmarkResolution
+      - Kind  : RemoveTypeWordsFromElements
+  - Type: ^CFComparisonResult$
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: kCFCompare
+  - Type: ^CFStringBuiltInEncodings$
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: kCFStringEncoding
+  - Type: ^CFISO8601DateFormatOptions$
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: kCFISO8601DateFormatWith
+
+  - Type: ^CFStringEncodings$
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: kCFStringEncoding
+
+  - Type: ^(CF).+
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: kCF
+  - Type: .*
+    Transforms:
+      - Kind  : RemoveTypeWordsFromElements
+      - Kind  : RemovePartialTypeNamePrefix
+      - Kind  : RemoveUnderscorePrefix
+      - Kind  : UnderscoreNumbers
+
+  TypeTransforms:
+    - Type: ^CFStringEncodings$
+      Transforms:
+      - Kind  : RemoveSuffix
+        Source: s
+    - Type: ^(CF(?!AbsoluteTime)).+
+      Transforms:
+        - Kind  : RemovePrefix
+          Source: $group0
+    - Type: Flag$ # Transforms for bit_set types
+      Transforms:
+      - Kind  : AppendSuffix
+        Source: s
+    - Type: Mask$
+      Transforms:
+      - Kind  : None
+      
+
+  BitSetMap:
+    - Type: Flags?$
+      Transforms:
+        - Kind  : RemoveSuffix
+          Source: s
+    - Type: Mask$
+      Transforms:
+        - Kind  : AppendSuffix
+          Source: Flag
+ 
+  ProcTransforms:
+  - Type: ^(_*CF).+
+    Transforms:
+      - Kind  : RemovePrefix
+        Source: $group0
+
+  VarTransforms:
+    # - Type: ^(kCFLocaleIdentifier|kCFNumberFormatterRoundingMode)$
+    - Type: ^kCF.+
+      Transforms:
+        - Kind  : ReplacePrefix
+          Source: kCF
+          Target: k
+    - Type: ^_kCF.+
+      Transforms:
+        - Kind  : ReplacePrefix
+          Source: _kCF
+          Target: k

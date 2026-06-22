@@ -9,6 +9,35 @@ module shared;
 
 #pragma warning(disable: 39001)
 
+#if defined(__metal__)
+
+// Bindings for metal buffers
+
+// Already the default on metal and it's usage is also disallowed
+// when targeting the metal shading language. 
+#define NonUniformResourceIndex(idx) idx
+
+[[vk::binding(1,  0)]] public ParameterBlock<Texture2D[]> texture2DHeap : register(t1);
+[[vk::binding(2,  0)]] public ParameterBlock<Texture1D[]> texture1DHeap : register(t2);
+[[vk::binding(3,  0)]] public ParameterBlock<Texture3D[]> texture3DHeap : register(t3);
+[[vk::binding(4,  0)]] public ParameterBlock<TextureCube[]> textureCubeHeap : register(t4);
+[[vk::binding(5,  0)]] public ParameterBlock<Texture2DArray[]> texture2DArrayHeap : register(t5);
+[[vk::binding(6,  0)]] public ParameterBlock<TextureCubeArray[]> textureCubeArrayHeap : register(t6);
+[[vk::binding(7,  0)]] public ParameterBlock<Texture1DArray[]> texture1DArrayHeap : register(t7);
+
+[[vk::binding(8,  0)]] public ParameterBlock<RWTexture2D<float4>[]> texture2DHeapRW : register(t8);
+[[vk::binding(9,  0)]] public ParameterBlock<RWTexture1D<float4>[]> texture1DHeapRW : register(t9);
+[[vk::binding(10, 0)]] public ParameterBlock<RWTexture3D<float4>[]> texture3DHeapRW : register(t10);
+[[vk::binding(11, 0)]] public ParameterBlock<RWTexture2DArray<float4>[]> texture2DArrayHeapRW : register(t11);
+[[vk::binding(12, 0)]] public ParameterBlock<RWTexture1DArray<float4>[]> texture1DArrayHeapRW : register(t12);
+
+[[vk::binding(13, 0)]] public ParameterBlock<SamplerState[]> samplerHeap : register(t13);
+[[vk::binding(14, 0)]] ParameterBlock<RaytracingAccelerationStructure[]> bvhHeap : register(t14);
+
+#else
+
+// Bindings for vulkan descriptor sets
+
 [[vk::binding(0, TEXTURE_HEAP_BINDING)]] public Texture2D texture2DHeap[];
 [[vk::binding(0, TEXTURE_HEAP_BINDING)]] public Texture1D texture1DHeap[];
 [[vk::binding(0, TEXTURE_HEAP_BINDING)]] public Texture3D texture3DHeap[];
@@ -25,6 +54,8 @@ module shared;
 
 [[vk::binding(0, SAMPLER_HEAP_BINDING)]] public SamplerState samplerHeap[];
 [[vk::binding(0, BVH_HEAP_BINDING)]] RaytracingAccelerationStructure bvhHeap[];
+
+#endif
 
 // Push constant blocks - different structures for graphics vs compute shaders
 public struct __PushConstants_Graphics

@@ -1,4 +1,4 @@
-
+#+build !darwin
 package gpu
 
 import "core:slice"
@@ -1018,8 +1018,9 @@ _wait_idle :: proc()
     if sync.guard(&ctx.queue_lock) do vk.DeviceWaitIdle(ctx.device)
 }
 
-_swapchain_init :: proc(surface: vk.SurfaceKHR, init_size: [2]u32, frames_in_flight: u32)
+_swapchain_init :: proc(_surface: rawptr, init_size: [2]u32, frames_in_flight: u32)
 {
+    surface := (^vk.SurfaceKHR)(_surface)^;
     ctx.frames_in_flight = frames_in_flight
     ctx.surface = surface
 
