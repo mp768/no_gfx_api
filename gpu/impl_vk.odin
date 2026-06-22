@@ -71,7 +71,9 @@ Context :: struct
     swapchain_image_idx: u32,
     frames_in_flight: u32,
 
-    lock: sync.Atomic_Mutex, // Ensures thread-safe access to ctx and VK operations
+    cmd_buf_lock: sync.Atomic_Mutex,
+    queue_lock: sync.Atomic_Mutex,
+    tls_lock: sync.Atomic_Mutex,
     tls_contexts: [dynamic]^Thread_Local_Context,
 }
 
@@ -872,7 +874,7 @@ get_tls :: proc() -> ^Thread_Local_Context
         )
     }
 
-    if sync.guard(&ctx.lock) do append(&ctx.tls_contexts, tls_ctx)
+    if sync.guard(&ctx.tls_lock) do append(&ctx.tls_contexts, tls_ctx)
 
     return tls_ctx
 }
@@ -1013,18 +1015,14 @@ _cleanup :: proc(loc := #caller_location)
 
 _wait_idle :: proc()
 {
-    sync.guard(&ctx.lock)
-    vk.DeviceWaitIdle(ctx.device)
+    if sync.guard(&ctx.queue_lock) do vk.DeviceWaitIdle(ctx.device)
 }
 
 _swapchain_init :: proc(_surface: rawptr, init_size: [2]u32, frames_in_flight: u32)
 {
     surface := (^vk.SurfaceKHR)(_surface)^;
-    
-    if sync.guard(&ctx.lock) {
-        ctx.frames_in_flight = frames_in_flight
-        ctx.surface = surface
-    }
+    ctx.frames_in_flight = frames_in_flight
+    ctx.surface = surface
 
     // NOTE: surface_caps.currentExtent could be max(u32)!!!
     surface_caps: vk.SurfaceCapabilitiesKHR
@@ -1070,28 +1068,18 @@ _swapchain_acquire_next :: proc() -> Texture
     vk_check(vk.CreateFence(ctx.device, &fence_ci, nil, &fence))
     defer vk.DestroyFence(ctx.device, fence, nil)
 
-    if sync.guard(&ctx.lock) {
-        res := vk.AcquireNextImageKHR(ctx.device, ctx.swapchain.handle, max(u64), {}, fence, &ctx.swapchain_image_idx)
-        if res == .SUBOPTIMAL_KHR do log.warn("Suboptimal swapchain acquire!")
-        if res != .SUCCESS && res != .SUBOPTIMAL_KHR {
-            vk_check(res)
-        }
+    res := vk.AcquireNextImageKHR(ctx.device, ctx.swapchain.handle, max(u64), {}, fence, &ctx.swapchain_image_idx)
+    if res == .SUBOPTIMAL_KHR do log.warn("Suboptimal swapchain acquire!")
+    if res != .SUCCESS && res != .SUBOPTIMAL_KHR {
+        vk_check(res)
     }
 
     vk_check(vk.WaitForFences(ctx.device, 1, &fence, true, max(u64)))
 
     // Transition layout from swapchain
     {
-        cmd_buf := vk_acquire_cmd_buf(.Main)
-        cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-
-        vk_cmd_buf := cmd_buf_info.handle
-
-        cmd_buf_bi := vk.CommandBufferBeginInfo {
-            sType = .COMMAND_BUFFER_BEGIN_INFO,
-            flags = { .ONE_TIME_SUBMIT },
-        }
-        vk_check(vk.BeginCommandBuffer(vk_cmd_buf, &cmd_buf_bi))
+        cmd_buf := commands_begin(.Main)
+        vk_cmd_buf := vk_get_command_buffer(cmd_buf)
 
         transition := vk.ImageMemoryBarrier2 {
             sType = .IMAGE_MEMORY_BARRIER_2,
@@ -1114,9 +1102,7 @@ _swapchain_acquire_next :: proc() -> Texture
             pImageMemoryBarriers = &transition,
         })
 
-        vk_check(vk.EndCommandBuffer(vk_cmd_buf))
-
-        vk_submit_cmd_bufs({cmd_buf})
+        queue_submit(.Main, {cmd_buf})
     }
 
     return Texture {
@@ -1135,27 +1121,18 @@ _swapchain_present :: proc(queue: Queue, sem_wait: Semaphore, wait_value: u64)
     queue_info := ctx.queues[queue]
     vk_queue := queue_info.handle
 
-    vk_sem_wait := pool_get(&ctx.semaphores, sem_wait)
-
     present_semaphore := ctx.swapchain.present_semaphores[ctx.swapchain_image_idx]
+    vk_present_semaphore := vk_get_semaphore(present_semaphore)
 
     // NOTE: Workaround for the fact that swapchain presentation
     // only supports binary semaphores.
     // wait on sem_wait on wait_value and signal ctx.binary_sem
     {
+        cmd_buf := commands_begin(queue)
+        vk_cmd_buf := vk_get_command_buffer(cmd_buf)
+
         // Switch to optimal layout for presentation (this is mandatory)
-        cmd_buf: Command_Buffer
         {
-            cmd_buf = vk_acquire_cmd_buf(queue)
-            cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-            vk_cmd_buf := cmd_buf_info.handle
-
-            cmd_buf_bi := vk.CommandBufferBeginInfo {
-                sType = .COMMAND_BUFFER_BEGIN_INFO,
-                flags = { .ONE_TIME_SUBMIT },
-            }
-            vk_check(vk.BeginCommandBuffer(vk_cmd_buf, &cmd_buf_bi))
-
             transition := vk.ImageMemoryBarrier2 {
                 sType = .IMAGE_MEMORY_BARRIER_2,
                 image = ctx.swapchain.images[ctx.swapchain_image_idx],
@@ -1176,73 +1153,27 @@ _swapchain_present :: proc(queue: Queue, sem_wait: Semaphore, wait_value: u64)
                 imageMemoryBarrierCount = 1,
                 pImageMemoryBarriers = &transition,
             })
-
-            vk_check(vk.EndCommandBuffer(vk_cmd_buf))
         }
 
-        // NOTE: Submissions must be performed in order w.r.t the timeline value used.
-        sync.guard(&ctx.lock)
-
-        if cmd_buf_info, r_lock := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(r_lock) {
-            cmd_buf_info.timeline_value = sync.atomic_add(&ctx.cmd_bufs_sem_vals[cmd_buf_info.queue].val, 1) + 1
-        }
-
-        cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-        vk_cmd_buf := cmd_buf_info.handle
-        queue_sem := ctx.cmd_bufs_sem_vals[cmd_buf_info.queue].sem
-        vk_queue_sem := pool_get(&ctx.semaphores, queue_sem)
-
-        wait_stage_flags := vk.PipelineStageFlags { .COLOR_ATTACHMENT_OUTPUT }
-        next: rawptr
-        next = &vk.TimelineSemaphoreSubmitInfo {
-            sType = .TIMELINE_SEMAPHORE_SUBMIT_INFO,
-            pNext = next,
-            waitSemaphoreValueCount = 1,
-            pWaitSemaphoreValues = raw_data([]u64 {
-                wait_value,
-            }),
-            signalSemaphoreValueCount = 2,
-            pSignalSemaphoreValues = raw_data([]u64 {
-                {},
-                cmd_buf_info.timeline_value,
-            })
-        }
-        submit_info := vk.SubmitInfo {
-            sType = .SUBMIT_INFO,
-            pNext = next,
-            commandBufferCount = 1,
-            pCommandBuffers = &vk_cmd_buf,
-            waitSemaphoreCount = 1,
-            pWaitSemaphores = raw_data([]vk.Semaphore {
-                vk_sem_wait,
-            }),
-            pWaitDstStageMask = raw_data([]vk.PipelineStageFlags {
-                wait_stage_flags,
-            }),
-            signalSemaphoreCount = 2,
-            pSignalSemaphores = raw_data([]vk.Semaphore {
-                present_semaphore,
-                vk_queue_sem,
-            }),
-        }
-
-        vk_check(vk.QueueSubmit(vk_queue, 1, &submit_info, {}))
-
-        recycle_cmd_buf(cmd_buf)
+        cmd_add_wait_semaphore(cmd_buf, sem_wait, wait_value)
+        cmd_add_signal_semaphore(cmd_buf, present_semaphore, 0)  // This is a binary semaphore, so the value is unused here.
+        queue_submit(queue, { cmd_buf })
     }
 
-    sync.guard(&ctx.lock)
-    res := vk.QueuePresentKHR(vk_queue, &{
-        sType = .PRESENT_INFO_KHR,
-        swapchainCount = 1,
-        waitSemaphoreCount = 1,
-        pWaitSemaphores = &present_semaphore,
-        pSwapchains = &ctx.swapchain.handle,
-        pImageIndices = &ctx.swapchain_image_idx,
-    })
-    if res == .SUBOPTIMAL_KHR do log.warn("Suboptimal swapchain acquire!")
-    if res != .SUCCESS && res != .SUBOPTIMAL_KHR {
-        vk_check(res)
+    if sync.guard(&ctx.queue_lock)
+    {
+        res := vk.QueuePresentKHR(vk_queue, &{
+            sType = .PRESENT_INFO_KHR,
+            swapchainCount = 1,
+            waitSemaphoreCount = 1,
+            pWaitSemaphores = &vk_present_semaphore,
+            pSwapchains = &ctx.swapchain.handle,
+            pImageIndices = &ctx.swapchain_image_idx,
+        })
+        if res == .SUBOPTIMAL_KHR do log.warn("Suboptimal swapchain acquire!")
+        if res != .SUCCESS && res != .SUBOPTIMAL_KHR {
+            vk_check(res)
+        }
     }
 }
 
@@ -1440,15 +1371,8 @@ _texture_create :: proc(desc: Texture_Desc, storage: gpuptr, queue: Queue = .Mai
 
     // Transition layout from UNDEFINED to GENERAL
     {
-        cmd_buf := vk_acquire_cmd_buf(queue_to_use)
-        cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-        vk_cmd_buf := cmd_buf_info.handle
-
-        cmd_buf_bi := vk.CommandBufferBeginInfo {
-            sType = .COMMAND_BUFFER_BEGIN_INFO,
-            flags = { .ONE_TIME_SUBMIT },
-        }
-        vk_check(vk.BeginCommandBuffer(vk_cmd_buf, &cmd_buf_bi))
+        cmd_buf := commands_begin(queue_to_use)
+        vk_cmd_buf := vk_get_command_buffer(cmd_buf)
 
         transition := vk.ImageMemoryBarrier2 {
             sType = .IMAGE_MEMORY_BARRIER_2,
@@ -1471,9 +1395,8 @@ _texture_create :: proc(desc: Texture_Desc, storage: gpuptr, queue: Queue = .Mai
             pImageMemoryBarriers = &transition,
         })
 
-        vk_check(vk.EndCommandBuffer(vk_cmd_buf))
         if signal_sem != {} do cmd_add_signal_semaphore(cmd_buf, signal_sem, signal_value)
-        vk_submit_cmd_bufs({cmd_buf})
+        queue_submit(queue_to_use, { cmd_buf })
     }
 
     vk_set_debug_name(name, u64(image), .IMAGE)
@@ -2240,7 +2163,7 @@ get_vk_tlas_size_info :: proc(desc: TLAS_Desc) -> vk.AccelerationStructureBuildS
 
 _queue_wait_idle :: proc(queue: Queue)
 {
-    if sync.guard(&ctx.lock) do vk.QueueWaitIdle(ctx.queues[queue].handle)
+    if sync.guard(&ctx.queue_lock) do vk.QueueWaitIdle(ctx.queues[queue].handle)
 }
 
 _commands_begin :: proc(queue: Queue, loc := #caller_location) -> Command_Buffer
@@ -3291,7 +3214,7 @@ create_swapchain :: proc(width: u32, height: u32, frames_in_flight: u32) -> Swap
         imageColorSpace = surface_format.colorSpace,
         imageExtent = { res.width, res.height },
         imageArrayLayers = 1,
-        imageUsage = { .COLOR_ATTACHMENT },
+        imageUsage = { .COLOR_ATTACHMENT, .TRANSFER_SRC, .TRANSFER_DST },
         preTransform = surface_caps.currentTransform,
         compositeAlpha = { .OPAQUE },
         presentMode = present_mode,
@@ -3325,11 +3248,14 @@ create_swapchain :: proc(width: u32, height: u32, frames_in_flight: u32) -> Swap
         res.texture_handles[i] = pool_add(&ctx.textures, tex_info, {})
     }
 
-    res.present_semaphores = make([]vk.Semaphore, image_count, context.allocator)
+    res.present_semaphores = make([]Semaphore, image_count, context.allocator)
 
     semaphore_ci := vk.SemaphoreCreateInfo { sType = .SEMAPHORE_CREATE_INFO }
-    for &semaphore in res.present_semaphores {
-        vk_check(vk.CreateSemaphore(ctx.device, &semaphore_ci, nil, &semaphore))
+    for &semaphore in res.present_semaphores
+    {
+        vk_sem: vk.Semaphore
+        vk_check(vk.CreateSemaphore(ctx.device, &semaphore_ci, nil, &vk_sem))
+        semaphore = vk_move_semaphore(vk_sem)
     }
 
     return res
@@ -3340,7 +3266,7 @@ destroy_swapchain :: proc(swapchain: ^Swapchain)
 {
     delete(swapchain.images)
     for semaphore in swapchain.present_semaphores {
-        vk.DestroySemaphore(ctx.device, semaphore, nil)
+        semaphore_destroy(semaphore)
     }
     delete(swapchain.present_semaphores)
     for image_view in swapchain.image_views {
@@ -3369,7 +3295,7 @@ Swapchain :: struct
     images: []vk.Image,
     texture_handles: []Texture_Handle,
     image_views: []vk.ImageView,
-    present_semaphores: []vk.Semaphore,
+    present_semaphores: []Semaphore,
 }
 
 @(private="file")
@@ -3400,7 +3326,8 @@ get_buf_size_from_gpu_ptr :: proc(p: gpuptr) -> (size: vk.DeviceSize, ok: bool)
 vk_acquire_cmd_buf :: proc(queue: Queue) -> Command_Buffer
 {
     tls_ctx := get_tls()
-    sync.guard(&ctx.lock)
+
+    sync.guard(&ctx.cmd_buf_lock)
 
     // Check whether there is a free command buffer available with a timeline value that is less than or equal to the current semaphore value
     if handle, ok := priority_queue.pop_safe(&tls_ctx.free_buffers[queue]); ok {
@@ -3455,9 +3382,6 @@ vk_acquire_cmd_buf :: proc(queue: Queue) -> Command_Buffer
 vk_submit_cmd_bufs :: proc(cmd_bufs: []Command_Buffer)
 {
     if len(cmd_bufs) <= 0 do return
-
-    // NOTE: Submissions must be performed in order w.r.t the timeline value used.
-    sync.guard(&ctx.lock)
 
     for cmd_buf in cmd_bufs
     {
@@ -3529,7 +3453,9 @@ vk_submit_cmd_bufs :: proc(cmd_bufs: []Command_Buffer)
 
     queue_info := ctx.queues[queue]
     vk_queue := queue_info.handle
-    vk_check(vk.QueueSubmit(vk_queue, u32(len(submit_infos)), raw_data(submit_infos), {}))
+    if sync.guard(&ctx.queue_lock) {
+        vk_check(vk.QueueSubmit(vk_queue, u32(len(submit_infos)), raw_data(submit_infos), {}))
+    }
 
     for cmd_buf in cmd_bufs {
         recycle_cmd_buf(cmd_buf)
@@ -3543,8 +3469,10 @@ recycle_cmd_buf :: proc(cmd_buf: Command_Buffer)
 
     clear_cmd_buf(cmd_buf)
 
-    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-    priority_queue.push(&tls_ctx.free_buffers[cmd_buf_info.queue], Free_Command_Buffer { pool_handle = cmd_buf_info.pool_handle, timeline_value = cmd_buf_info.timeline_value })
+    if sync.guard(pool_get_lock(&ctx.command_buffers, cmd_buf)) {
+        cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
+        priority_queue.push(&tls_ctx.free_buffers[cmd_buf_info.queue], Free_Command_Buffer { pool_handle = cmd_buf_info.pool_handle, timeline_value = cmd_buf_info.timeline_value })
+    }
 }
 
 @(private="file")
@@ -3649,6 +3577,11 @@ _vk_get_buffer :: proc(addr: gpuptr) -> (vk.Buffer, u32)
     return buf, offset
 }
 
+_vk_get_semaphore :: proc(semaphore: Semaphore) -> vk.Semaphore
+{
+    return pool_get(&ctx.semaphores, semaphore)
+}
+
 _vk_wrap_image :: proc(image: vk.Image, desc: Texture_Desc, name := "", loc := #caller_location) -> Texture
 {
     desc_clean := texture_desc_cleanup(desc)
@@ -3718,8 +3651,10 @@ to_vk_render_attachment :: #force_inline proc(attach: Render_Attachment) -> vk.R
             format = to_vk_texture_format(view_desc_clean.format),
             subresourceRange = {
                 aspectMask = plane_aspect,
-                levelCount = 1,
-                layerCount = 1,
+                baseMipLevel = u32(view_desc_clean.base_mip),
+                levelCount = u32(view_desc_clean.mip_count),
+                baseArrayLayer = u32(view_desc_clean.base_layer),
+                layerCount = u32(view_desc_clean.layer_count),
             }
         }
         view = get_or_add_image_view(texture.handle, image_view_ci)
@@ -3735,8 +3670,10 @@ to_vk_render_attachment :: #force_inline proc(attach: Render_Attachment) -> vk.R
             format = to_vk_texture_format(resolve_view_desc_clean.format),
             subresourceRange = {
                 aspectMask = plane_aspect,
-                levelCount = 1,
-                layerCount = 1,
+                baseMipLevel = u32(resolve_view_desc_clean.base_mip),
+                levelCount = u32(resolve_view_desc_clean.mip_count),
+                baseArrayLayer = u32(resolve_view_desc_clean.base_layer),
+                layerCount = u32(resolve_view_desc_clean.layer_count),
             }
         }
         resolve_view = get_or_add_image_view(resolve_texture.handle, resolve_image_view_ci)
@@ -3928,6 +3865,11 @@ check_bvh_must_be_blas :: proc(bvh: BVH, name: string, loc: runtime.Source_Code_
 @(private="file")
 check_texture_descriptor :: proc(desc: Texture_Descriptor, name: string, index: int, loc: runtime.Source_Code_Location) -> bool
 {
+    if desc == {} || texture_descriptor_get_handle(desc) == {} {
+        log.errorf("'%v[%v]' texture descriptor is nil.", name, index, location = loc)
+        return false
+    }
+
     if !pool_check_no_message(&ctx.textures, texture_descriptor_get_handle(desc)) {
         log.errorf("'%v[%v]' texture descriptor is stale, the underlying texture has been freed.", name, index, location = loc)
         return false
