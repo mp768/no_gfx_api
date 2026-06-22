@@ -139,7 +139,9 @@ Context :: struct
     swapchain_image_idx: u32,
     frames_in_flight: u32,
 
-    lock: sync.Atomic_Mutex, // Ensures thread-safe access to ctx and VK operations
+    cmd_buf_lock: sync.Atomic_Mutex,
+    queue_lock: sync.Atomic_Mutex,
+    tls_lock: sync.Atomic_Mutex,
     tls_contexts: [dynamic]^Thread_Local_Context,
 }
 
@@ -423,7 +425,7 @@ get_tls :: proc() -> ^Thread_Local_Context
         )
     }
 
-    if sync.guard(&ctx.lock) do append(&ctx.tls_contexts, tls_ctx)
+    if sync.guard(&ctx.tls_lock) do append(&ctx.tls_contexts, tls_ctx)
 
     return tls_ctx
 }
@@ -584,7 +586,7 @@ _cleanup :: proc(loc := #caller_location)
 
 _wait_idle :: proc()
 {
-    sync.guard(&ctx.lock)
+    sync.guard(&ctx.queue_lock)
 
     #unroll for queue in Queue 
     {
@@ -1650,7 +1652,7 @@ get_vk_tlas_size_info :: proc(desc: TLAS_Desc) -> vk.AccelerationStructureBuildS
 
 _queue_wait_idle :: proc(queue: Queue)
 {
-    sync.guard(&ctx.lock)
+    sync.guard(&ctx.queue_lock)
 
     mtl_queue := ctx.queues[queue]
     
@@ -2036,99 +2038,12 @@ _cmd_set_shaders :: proc(cmd_buf: Command_Buffer, vert_shader: Shader, frag_shad
         if !ok do return
     }
 
-    // TODO: For the render pipeline, hold off on creating it until we get to a draw
-    // call. Until we call a draw procedure, we'll propagate the values passed into
-    // these procedure, '_cmd_set_depth_state', '_cmd_set_raster_state', and so on.
-    // 
-    // Then for the Render_Pipeline_Handle, we'll unfortunately have to make it
-    // a hash of the current set of configurations. We'll do a map[u64]^mtl.RenderPipelineState,
-    // for the caching. 
-    // 
-    // For the hash we'll use, we can just do something like this:
-    // ```
-    // import "core:hash/xxhash"
-    // import "core:mem"
-    // 
-    // My_Struct :: struct { ... }
-    // s: My_Struct = ...
-    // 
-    // bytes := mem.slice_from_ptr(cast([^]u8)&s, size_of(My_Struct))
-	//
-	// hash: u64 = xxhash.XXH64(bytes)
-    // ```
-    // 
-    // IMPORTANT: Don't forget to include sync guards to prevent multi-threading
-    // issues when it comes time to append or look-up render pipelines from the 
-    // cache.
-    // 
-    // We can apply the same with compute pipelines if necessary. However, I feel
-    // it most likely won't be. Compared to the render pipeline, the compute pass
-    // shouldn't have as many inline configuration options.
-
     cmd_buf_info, cmd_sync := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
 
     cmd_buf_info.vert_shader = vert_shader
     cmd_buf_info.frag_shader = frag_shader
 
     cmd_buf_info.graphics_shader_source_location = loc
-
-    /*
-    pipeline_handle: Render_Pipeline_Handle
-    pipeline_handle[0] = rawptr(vert_shader)
-    pipeline_handle[1] = rawptr(frag_shader)
-
-    render_pipeline: ^mtl.RenderPipelineState
-    if pipeline_handle not_in ctx.render_pipelines
-    {
-        vert_shader := pool_get(&ctx.shaders, vert_shader)
-        frag_shader := pool_get(&ctx.shaders, frag_shader)
-
-        assert(!vert_shader.is_compute, "Expected the first shader given to be a vertex shader. Instead, we got a compute shader.", loc = loc)
-        assert(!frag_shader.is_compute, "Expected the second shader given to be a fragment shader. Instead, we got a compute shader.", loc = loc)
-        assert(vert_shader.graphics_type == .Vertex, "Expected the first shader given to be a vertex shader. Instead, we got a fragment shader.", loc = loc)
-        assert(frag_shader.graphics_type == .Fragment, "Expected the second shader given to be a fragment shader. Instead, we got a vertex shader.", loc = loc)
-
-        pipe_desc := objc_alloc(mtl.MTL4RenderPipelineDescriptor)
-        defer pipe_desc->release()
-
-        pipe_desc->setVertexFunctionDescriptor(vert_shader.handle)
-        pipe_desc->setFragmentFunctionDescriptor(frag_shader.handle)
-
-        // TODO: Figure out a proper value for this.
-        pipe_desc->setRasterSampleCount(1)
-
-        compile_task_options := objc_alloc(mtl.MTL4CompilerTaskOptions)
-        defer compile_task_options->release()
-        
-        err: ^ns.Error
-        render_pipeline = (ctx.shader_compiler)->newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(pipe_desc, compile_task_options, &err)
-
-        mtl_ensure(err, "Unable to create new render pipeline with given shaders on line %v, col %v, in '%v'", loc.line, loc.column, loc.file_path)
-
-        ctx.render_pipelines[pipeline_handle] = render_pipeline
-    }
-    else 
-    {
-        render_pipeline, _ = ctx.render_pipelines[pipeline_handle]
-    }
-
-    encoder->setRenderPipelineState(render_pipeline)
-    */
-
-    /*
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
-    vert_shader := pool_get(&ctx.shaders, vert_shader)
-    frag_shader := pool_get(&ctx.shaders, frag_shader)
-
-    vk_cmd_buf := cmd_buf.handle
-    vk_vert_shader := vert_shader.handle
-    vk_frag_shader := frag_shader.handle
-
-    shader_stages := []vk.ShaderStageFlags { { .VERTEX }, { .FRAGMENT } }
-    to_bind := []vk.ShaderEXT { vk_vert_shader, vk_frag_shader }
-    assert(len(shader_stages) == len(to_bind))
-    vk.CmdBindShadersEXT(vk_cmd_buf, u32(len(shader_stages)), raw_data(shader_stages), raw_data(to_bind))
-    */
 }
 
 _cmd_set_depth_state :: proc(cmd_buf: Command_Buffer, state: Depth_State, loc := #caller_location)
@@ -2419,7 +2334,7 @@ _cmd_begin_render_pass :: proc(cmd_buf: Command_Buffer, desc: Render_Pass_Desc, 
     }
 
     render_pass_desc->setDefaultRasterSampleCount(ns.UInteger(sampler_count))
-    render_pass_desc->setRenderTargetArrayLength(ns.UInteger(layer_count))
+    // render_pass_desc->setRenderTargetArrayLength(ns.UInteger(layer_count))
 
     for attach, i in desc.color_attachments
     {
@@ -2564,7 +2479,7 @@ mtl_set_up_render_state :: proc(cmd_buf_info: Command_Buffer_Info, encoder: ^mtl
             // NOTE: Unlike in vulkan, there does not exist a separate procedure
             // used to mark if depth testing is enabled. Instead, metal makes use 
             // of the '.Always' flag to indicate that it's disabled, simply through 
-            // the logically conclusion that if everything passes then it's not 
+            // the logical conclusion that if everything passes then it's not 
             // doing it's main job, marking it effectively as disabled.
             depth_stencil_desc->setDepthCompareFunction(
                 to_mtl_compare_op(cmd_buf_info.depth_state.compare) if .Read in depth_state.mode else .Always
@@ -3013,7 +2928,7 @@ reset_advanced_ptr :: proc(p: ^ptr)
 mtl_acquire_cmd_buf :: proc(queue: Queue) -> Command_Buffer
 {
     tls_ctx := get_tls()
-    sync.guard(&ctx.lock)
+    sync.guard(&ctx.cmd_buf_lock)
 
     // Check whether there is a free command buffer available with a timeline value that is less than or equal to the current semaphore value
     if handle, ok := priority_queue.pop_safe(&tls_ctx.free_buffers[queue]); ok {
@@ -3081,7 +2996,7 @@ mtl_submit_cmd_bufs :: proc(cmd_bufs: []Command_Buffer)
     if len(cmd_bufs) <= 0 do return
 
     // NOTE: Submissions must be performed in order w.r.t the timeline value used.
-    sync.guard(&ctx.lock)
+    sync.guard(&ctx.queue_lock)
 
     for cmd_buf in cmd_bufs
     {
@@ -3130,8 +3045,10 @@ recycle_cmd_buf :: proc(cmd_buf: Command_Buffer)
 
     clear_cmd_buf(cmd_buf)
 
-    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-    priority_queue.push(&tls_ctx.free_buffers[cmd_buf_info.queue], Free_Command_Buffer { pool_handle = cmd_buf_info.pool_handle, timeline_value = cmd_buf_info.timeline_value })
+    if sync.guard(pool_get_lock(&ctx.command_buffers, cmd_buf)) {
+        cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
+        priority_queue.push(&tls_ctx.free_buffers[cmd_buf_info.queue], Free_Command_Buffer { pool_handle = cmd_buf_info.pool_handle, timeline_value = cmd_buf_info.timeline_value })
+    }
 }
 
 @(private="file")
@@ -3252,10 +3169,14 @@ mtl_update_render_pass_attachment :: proc(attach: Render_Attachment, mtl_attach:
     has_output := attach.texture != {}
     has_resolve := attach.resolve_texture != {}
 
+    view_desc_clean := texture_view_desc_cleanup(attach.texture, attach.view)
+    resolve_view_desc_clean := texture_view_desc_cleanup(attahc.resolve_texture, attach.resolve_view)
+
     if has_output
     {
         texture_info := pool_get(&ctx.textures, attach.texture.handle)
         mtl_attach->setTexture(texture_info.handle)
+
     }
 
     if has_resolve
