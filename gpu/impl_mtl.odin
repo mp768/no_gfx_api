@@ -10,7 +10,11 @@ import "core:dynlib"
 import "core:container/priority_queue"
 import "core:strings"
 import "core:fmt"
+import "core:hash/xxhash"
 import intr "base:intrinsics"
+
+// Temp: Just do avoid compilation errors
+import vk "vendor:vulkan"
 
 import mtl "darwodin/Metal"
 import ca "darwodin/QuartzCore"
@@ -87,6 +91,15 @@ Shader_Sampler_Descriptor_Index : ns.UInteger : 13
 Shader_BVH_Descriptor_Index : ns.UInteger : 14
 
 @(private="file")
+Total_Descriptor_Heap_Buffer_Count :: 14
+
+@(private="file")
+Render_Pipeline_Handle :: distinct u64
+
+@(private="file")
+Compute_Pipeline_Handle :: distinct Shader
+
+@(private="file")
 Alloc_Handle :: distinct Handle
 
 @(private="file")
@@ -113,6 +126,13 @@ Context :: struct
 
     cmd_bufs_sem_vals: [Queue]Semaphore_Value,
     idle_queue_sem_vals: [Queue]Semaphore_Value,
+
+    // cached pipelines
+    render_pipelines: map[Render_Pipeline_Handle]Render_Pipeline_Info,
+    compute_pipelines: map[Compute_Pipeline_Handle]^mtl.ComputePipelineState,
+
+    // cached depth stencil state
+    depth_stencil_states: map[Depth_State]^mtl.DepthStencilState,
 
     // Swapchain
     swapchain: Swapchain,
@@ -195,7 +215,8 @@ Sampler_Info :: struct
 }
 
 @(private="file")
-Shader_Info :: struct {
+Shader_Info :: struct 
+{
     handle: ^mtl.MTL4LibraryFunctionDescriptor,
     current_workgroup_size: [3]u32,
     is_compute: bool,
@@ -203,13 +224,57 @@ Shader_Info :: struct {
 }
 
 @(private="file")
-Command_Buffer_Info :: struct {
-    handle: ^mtl.CommandBuffer,
+Render_State_Info :: struct 
+{
+    vert_shader: Maybe(Shader),
+    frag_shader: Maybe(Shader),
+
+    depth_state: Depth_State,
+    raster_state: Raster_State,
+    blend_state: Blend_State,
+    viewport: Viewport,
+    scissor: Rect_2D,
+
+    render_sample_count: u32,
+    
+    graphics_shader_source_location: runtime.Source_Code_Location,
+}
+
+@(private="file")
+Render_Pipeline_Info :: struct
+{
+    state: ^mtl.RenderPipelineState,
+    depth_stencil: ^mtl.DepthStencilState,
+}
+
+@(private="file")
+Push_Constant_Buffer_Max_Size :: max(size_of(Graphics_Shader_Push_Constants), size_of(Compute_Shader_Push_Constants)) * 32
+
+@(private="file")
+Command_Buffer_Info :: struct 
+{
+    handle: ^mtl.MTL4CommandBuffer,
+    allocator: ^mtl.MTL4CommandAllocator,
+
+    argument_table: ^mtl.MTL4ArgumentTable,
+    push_constant_buffer: ptr,
+
     timeline_value: u64,
     thread_id: int,
     queue: Queue,
-    compute_shader: Maybe(Shader),
     recording: bool,
+    
+    encoder_type: enum u8 { None = 0, Compute, Render },
+    encoder: struct #raw_union {
+        base: ^mtl.MTL4CommandEncoder,
+        // NOTE: Compute encoder handles compute, blit, and acceleration 
+        compute: ^mtl.MTL4ComputeCommandEncoder,
+        render: ^mtl.MTL4RenderCommandEncoder,
+    }, 
+
+    compute_shader: Maybe(Shader),
+    using render_state: Render_State_Info,
+    
     pool_handle: Command_Buffer,
 
     wait_sems: [dynamic]Semaphore_Value,
@@ -224,6 +289,7 @@ Descriptor_Heap_Info :: struct
     textures_rw: ^mtl.Buffer,
     samplers: ^mtl.Buffer,
     bvhs: ^mtl.Buffer,
+    has_changed: bool,
 }
 
 @(private="file")
@@ -314,7 +380,7 @@ _init :: proc(validation := true, loc := #caller_location) -> bool
     // for the render and compute pipelines. (Although, this is probably 
     // a bad description for what this really is)
     {
-        compiler_desc: ^mtl.MTL4CompilerDescriptor = (mtl.MTL4CompilerDescriptor{})->alloc()
+        compiler_desc := objc_alloc(mtl.MTL4CompilerDescriptor)
         defer compiler_desc->release()
 
         err: ^ns.Error
@@ -365,8 +431,7 @@ get_tls :: proc() -> ^Thread_Local_Context
 @(private="file")
 mtl_create_residency_set :: proc(initial_capacity: u32, $set_type: string) -> ^mtl.ResidencySet
 {
-    set_desc: ^mtl.ResidencySetDescriptor
-    set_desc = (mtl.ResidencySetDescriptor{})->alloc()
+    set_desc := objc_alloc(mtl.ResidencySetDescriptor)
     defer set_desc->release()
 
     set_desc->setInitialCapacity(ns.UInteger(initial_capacity))
@@ -905,15 +970,13 @@ _texture_create :: proc(desc: Texture_Desc, storage: gpuptr, queue: Queue = .Mai
     mtl_queue := ctx.queues[queue]
     alloc_impl := transmute(Alloc_Impl_Info) storage._impl
     alloc_info := pool_get(&ctx.allocs, alloc_impl.handle)
-
     mtl_buf := alloc_info.buf_handle
 
     offset := uintptr(storage.ptr) - uintptr(alloc_info.gpu)
+    bytes_per_row := mtl_helper_bytes_per_row(desc.format, desc.dimensions[0])
     
     tex_desc := to_mtl_texture_descriptor(desc_clean)
     defer tex_desc->release()
-
-    bytes_per_row := mtl_helper_bytes_per_row(desc.format, desc.dimensions[0])
 
     mtl_tex := mtl_buf->newTextureWithDescriptor(tex_desc, ns.UInteger(offset), ns.UInteger(bytes_per_row))
     
@@ -966,7 +1029,7 @@ get_or_add_sampler :: proc(info: Sampler_Desc) -> ^mtl.SamplerState
         }
     }
 
-    desc: ^mtl.SamplerDescriptor = (mtl.SamplerDescriptor{})->alloc()
+    desc := objc_alloc(mtl.SamplerDescriptor)
     desc->init()
     defer desc->release()
 
@@ -1003,6 +1066,7 @@ _texture_descriptor :: proc(texture: Texture, view_desc: Texture_View_Desc, loc 
 
     desc: Texture_Descriptor
     desc[0] = u64(uintptr(tex_info.handle))
+    desc[1] = u64(uintptr(texture.handle))
 
     return desc
 }
@@ -1082,6 +1146,7 @@ _desc_heap_create :: proc(texture_count: u32 = 65536,
         textures_rw = textures_rw,
         samplers = samplers,
         bvhs = bvhs,
+        has_changed = false,
     }
     
     return pool_add(&ctx.desc_heaps, desc_heap_info, { created_at = loc, name = name })
@@ -1121,13 +1186,18 @@ _desc_heap_set_textures :: proc(heap: Descriptor_Heap, start_idx: u32, textures:
         if !ok do return
     }
 
+    if heap_info, heap_lock := pool_get_mut(&ctx.desc_heaps, heap); sync.guard(heap_lock) 
+    {
+        heap_info.has_changed = true
+    }
+
     heap_info := pool_get(&ctx.desc_heaps, heap)
 
     scratch, _ := acquire_scratch()
     texture_ids: []mtl.ResourceID = make([]mtl.ResourceID, len(textures), allocator = scratch)
     for &id, i in texture_ids
     {
-        texture := (^mtl.Texture)(uintptr(textures[i][0]))
+        texture := texture_descriptor_get_mtl_texture(textures[i])
 
         (heap_info.residency_set)->addAllocation(texture)
         
@@ -1153,13 +1223,18 @@ _desc_heap_set_textures_rw :: proc(heap: Descriptor_Heap, start_idx: u32, textur
         if !ok do return
     }
 
+    if heap_info, heap_lock := pool_get_mut(&ctx.desc_heaps, heap); sync.guard(heap_lock) 
+    {
+        heap_info.has_changed = true
+    }
+
     heap_info := pool_get(&ctx.desc_heaps, heap)
 
     scratch, _ := acquire_scratch()
     texture_ids: []mtl.ResourceID = make([]mtl.ResourceID, len(textures), allocator = scratch)
     for &id, i in texture_ids
     {
-        texture := (^mtl.Texture)(uintptr(textures[i][0]))
+        texture := texture_descriptor_get_mtl_texture(textures[i])
 
         (heap_info.residency_set)->addAllocation(texture)
         
@@ -1183,6 +1258,11 @@ _desc_heap_set_samplers :: proc(heap: Descriptor_Heap, start_idx: u32, samplers:
         ok := true
         ok &= pool_check(&ctx.desc_heaps, heap, "heap", loc)
         if !ok do return
+    }
+
+    if heap_info, heap_lock := pool_get_mut(&ctx.desc_heaps, heap); sync.guard(heap_lock) 
+    {
+        heap_info.has_changed = true
     }
 
     heap_info := pool_get(&ctx.desc_heaps, heap)
@@ -1263,7 +1343,7 @@ _shader_create_internal :: proc(code: []u32, is_compute: bool, graphics_stage: S
 
     library: ^mtl.Library
     {
-        lib_desc: ^mtl.MTL4LibraryDescriptor = (mtl.MTL4LibraryDescriptor{})->alloc()
+        lib_desc := objc_alloc(mtl.MTL4LibraryDescriptor)
         defer lib_desc->release()
     
         source_objc := to_mtl_string(source)
@@ -1277,7 +1357,7 @@ _shader_create_internal :: proc(code: []u32, is_compute: bool, graphics_stage: S
         mtl_ensure(err, "%v shader creation failed during library/source compilation.", "Compute" if is_compute else "Graphics")
     }
 
-    shader: ^mtl.MTL4LibraryFunctionDescriptor = (mtl.MTL4LibraryFunctionDescriptor{})->alloc()
+    shader := objc_alloc(mtl.MTL4LibraryFunctionDescriptor)
 
     shader->setLibrary(library)
 
@@ -1586,15 +1666,13 @@ _queue_wait_idle :: proc(queue: Queue)
 
 _commands_begin :: proc(queue: Queue, loc := #caller_location) -> Command_Buffer
 {
-    cmd_buf := vk_acquire_cmd_buf(queue)
+    cmd_buf := mtl_acquire_cmd_buf(queue)
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
 
-    cmd_buf_bi := vk.CommandBufferBeginInfo {
-        sType = .COMMAND_BUFFER_BEGIN_INFO,
-        flags = { .ONE_TIME_SUBMIT },
-    }
-    vk_cmd_buf := cmd_buf_info.handle
-    vk_check(vk.BeginCommandBuffer(vk_cmd_buf, &cmd_buf_bi))
+    mtl_cmd_buf := cmd_buf_info.handle
+    allocator := cmd_buf_info.allocator
+
+    mtl_cmd_buf->beginCommandBufferWithAllocator_(allocator)
 
     return cmd_buf
 }
@@ -1627,15 +1705,13 @@ _queue_submit :: proc(queue: Queue, cmd_bufs: []Command_Buffer, loc := #caller_l
     for cmd_buf in cmd_bufs
     {
         cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-        vk_cmd_buf := cmd_buf_info.handle
-        vk_check(vk.EndCommandBuffer(vk_cmd_buf))
+        mtl_cmd_buf := cmd_buf_info.handle
+
+        mtl_cmd_buf->endCommandBuffer()
     }
 
-    vk_submit_cmd_bufs(cmd_bufs)
-
-    for cmd_buf in cmd_bufs {
-        clear_cmd_buf(cmd_buf)
-    }
+    // NOTE: Submission already recycles cmd buffers for us
+    mtl_submit_cmd_bufs(cmd_bufs)
 }
 
 @(private="file")
@@ -1649,6 +1725,35 @@ clear_cmd_buf :: proc(cmd_buf: Command_Buffer)
 }
 
 // Commands
+
+@(private="file")
+mtl_get_compute_encoder :: proc(cmd_buf: Command_Buffer, loc := #caller_location) -> ^mtl.MTL4ComputeCommandEncoder
+{
+    cmd_buf_info, cmd_buf_sync := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(cmd_buf_sync)
+
+    if cmd_buf_info.encoder_type == .Compute {
+        return cmd_buf_info.encoder.compute
+    }
+
+    ensure(cmd_buf_info.encoder_type != .Render, "Cannot perform compute, blit, or accleration work within a render pass. Please consider doing this operation elsewhere.", loc = loc)
+
+    mtl_cmd_buf := cmd_buf_info.handle
+    
+    cmd_buf_info.encoder_type = .Compute
+    cmd_buf_info.encoder.compute = mtl_cmd_buf->computeCommandEncoder()
+   
+    return cmd_buf_info.encoder.compute 
+}
+
+@(private="file")
+mtl_get_render_encoder :: proc(cmd_buf: Command_Buffer, loc := #caller_location) -> ^mtl.MTL4RenderCommandEncoder
+{
+    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
+
+    ensure(cmd_buf_info.encoder_type == .Render, "Cannot perform this command outside of a render pass. Call 'cmd_begin_render_pass' to start one.", loc = loc)
+
+    return cmd_buf_info.encoder.render
+}
 
 _cmd_mem_copy_raw :: proc(cmd_buf: Command_Buffer, dst, src: gpuptr, #any_int bytes: i64, loc := #caller_location)
 {
@@ -1665,6 +1770,8 @@ _cmd_mem_copy_raw :: proc(cmd_buf: Command_Buffer, dst, src: gpuptr, #any_int by
     }
 
     if bytes == 0 do return
+
+    encoder := mtl_get_compute_encoder(cmd_buf, loc = loc)
 
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
 
@@ -1686,14 +1793,11 @@ _cmd_mem_copy_raw :: proc(cmd_buf: Command_Buffer, dst, src: gpuptr, #any_int by
 
     if to_copy > 0
     {
-        copy_regions := []vk.BufferCopy {
-            {
-                srcOffset = vk.DeviceSize(src_offset),
-                dstOffset = vk.DeviceSize(dst_offset),
-                size = vk.DeviceSize(to_copy),
-            }
-        }
-        vk.CmdCopyBuffer(cmd_buf_info.handle, src_buf, dst_buf, u32(len(copy_regions)), raw_data(copy_regions))
+        encoder->copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+            src_buf, ns.UInteger(src_offset),
+            dst_buf, ns.UInteger(dst_offset),
+            ns.UInteger(to_copy)
+        )
     }
 }
 
@@ -1708,34 +1812,62 @@ _cmd_copy_to_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, src: gpuptr,
         if !ok do return
     }
 
+    encoder := mtl_get_compute_encoder(cmd_buf, loc = loc)
+
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     tex_info := pool_get(&ctx.textures, dst.handle)
 
     src_buf, src_offset, ok_s := get_buf_offset_from_gpu_ptr(src)
     assert(ok_s)
 
-    plane_aspect := to_vk_image_aspect_flags(dst.format)
-    is_compressed := is_block_compressed(dst.format)
-
     mip_width := max(1, dst.dimensions.x >> region.mip_level)
     mip_height := max(1, dst.dimensions.y >> region.mip_level)
     mip_depth := max(1, dst.dimensions.z >> region.mip_level)
 
-    copy := vk.BufferImageCopy{
-        bufferOffset = vk.DeviceSize(src_offset),
-        bufferRowLength = 0 if is_compressed else mip_width,
-        bufferImageHeight = 0 if is_compressed else mip_height,
-        imageSubresource = {
-            aspectMask = plane_aspect,
-            mipLevel = region.mip_level,
-            baseArrayLayer = region.base_layer,
-            layerCount = max(1, region.layer_count),
-        },
-        imageOffset = {},
-        imageExtent = { mip_width, mip_height, mip_depth },
+    is_3d := dst.type == .D3
+
+    bytes_per_row := mtl_helper_bytes_per_row(dst.format, mip_width)
+    bytes_per_image := mtl_helper_bytes_per_image(dst.format, mip_width, mip_height, 1)
+
+    block_width := mtl_helper_texture_format_block_width(dst.format)
+    block_height := mtl_helper_texture_format_block_height(dst.format)
+
+    // Align each dimension to the block size of the destination texture 
+    aligned_width := ((mip_width + block_width - 1) / block_width) * block_width
+    aligned_height := ((mip_height + block_height - 1) / block_height) * block_height
+    
+    source_size: mtl.Size
+    source_size.width = ns.UInteger(min(aligned_width, mip_width))
+    source_size.height = ns.UInteger(min(aligned_height, mip_height))
+
+    // Depth corresponds to the layer count of an image array when the image is not 3D
+    source_size.depth = ns.UInteger(mip_depth if is_3d else region.layer_count)
+
+    // NOTE: This is (0, 0, 0), since we're only performing a full copy to the
+    // texture. If we were to implement the code using 'region.rect', this would have 
+    // to change and so would the 'source_size' measurement.
+    destination_origin: mtl.Origin
+    destination_origin.x = 0
+    destination_origin.y = 0
+    destination_origin.z = 0
+
+    src_bytes_per_image := ns.UInteger(0)
+    if is_3d || region.layer_count > 1
+    {
+        src_bytes_per_image = ns.UInteger(bytes_per_image)
     }
 
-    vk.CmdCopyBufferToImage(cmd_buf_info.handle, src_buf, tex_info.handle, .GENERAL, 1, &copy)
+    encoder->copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+        src_buf, 
+        ns.UInteger(src_offset), 
+        ns.UInteger(bytes_per_row), 
+        src_bytes_per_image,
+        source_size,
+        tex_info.handle,
+        ns.UInteger(region.base_layer),
+        ns.UInteger(region.mip_level),
+        destination_origin
+    )
 }
 
 // TODO: Missing: cmd_copy_from_texture
@@ -1749,6 +1881,10 @@ _cmd_blit_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, dst_rect: Blit_
         ok &= check_cmd_buf_must_be_graphics(cmd_buf, "cmd_buf", loc)
         if !ok do return
     }
+
+    encoder := mtl_get_compute_encoder(cmd_buf, loc = loc)
+
+    // TODO: Implement this
 
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     src_info := pool_get(&ctx.textures, src.handle)
@@ -1805,19 +1941,39 @@ _cmd_set_desc_heap :: proc(cmd_buf: Command_Buffer, heap: Descriptor_Heap, loc :
         if !ok do return
     }
 
+    if heap_info, heap_lock := pool_get_mut(&ctx.desc_heaps, heap); sync.guard(heap_lock)
+    {
+        // Commit any changes made to the descriptor heap here
+        if heap_info.has_changed 
+        {
+            heap_info.has_changed = false
+            (heap_info.residency_set)->commit()
+            (heap_info.residency_set)->requestResidency()
+        }
+    }
+
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf_info.handle
+    mtl_cmd_buf := cmd_buf_info.handle
 
     heap_info := pool_get(&ctx.desc_heaps, heap)
 
-    sets := [4]vk.DescriptorSet {
-        heap_info.textures,
-        heap_info.textures_rw,
-        heap_info.samplers,
-        heap_info.bvhs,
+    for index in Shader_Texture_Descriptor_Indices
+    {
+        (cmd_buf_info.argument_table)->setAddress_atIndex((heap_info.textures)->gpuAddress(), index)
     }
-    vk.CmdBindDescriptorSets(vk_cmd_buf, .GRAPHICS, ctx.common_pipeline_layout_graphics, 0, u32(len(ctx.desc_layouts)), &sets[0], 0, nil)
-    vk.CmdBindDescriptorSets(vk_cmd_buf, .COMPUTE, ctx.common_pipeline_layout_compute, 0, u32(len(ctx.desc_layouts)), &sets[0], 0, nil)
+
+    for index in Shader_Texture_RW_Descriptor_Indices
+    {
+        (cmd_buf_info.argument_table)->setAddress_atIndex((heap_info.textures_rw)->gpuAddress(), index)
+    }
+
+    (cmd_buf_info.argument_table)->setAddress_atIndex((heap_info.samplers)->gpuAddress(), Shader_Sampler_Descriptor_Index)
+    (cmd_buf_info.argument_table)->setAddress_atIndex((heap_info.bvhs)->gpuAddress(), Shader_BVH_Descriptor_Index)
+
+    mtl_cmd_buf->useResidencySet(heap_info.residency_set)
+    
+    // NOTE: Unlike the vulkan implementation, we'll bind the argument table
+    // at the draw/dispatch site instead (if it isn't already bound).
 }
 
 _cmd_add_wait_semaphore :: proc(cmd_buf: Command_Buffer, sem: Semaphore, wait_value: u64, loc := #caller_location)
@@ -1859,56 +2015,14 @@ _cmd_barrier :: proc(cmd_buf: Command_Buffer, before: Stage, after: Stage, hazar
         if !ok do return
     }
 
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
+    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
 
-    vk_cmd_buf := cmd_buf.handle
+    mtl_before := to_mtl_stage(before)
+    mtl_after  := to_mtl_stage(after)
 
-    vk_before := to_vk_stage(before)
-    vk_after  := to_vk_stage(after)
+    ensure(cmd_buf_info.encoder_type != .None, "Cannot place a barrier without being in an active encoding pass", loc = loc)
 
-    // Determine access masks based on hazards
-    src_access: vk.AccessFlags
-    dst_access: vk.AccessFlags
-
-    if .Draw_Arguments in hazards
-    {
-        // When compute shader writes draw arguments, ensure they're visible to indirect draw commands
-        // Source: compute shader writes
-        src_access += { .SHADER_WRITE }
-        // Destination: indirect command read (for draw/dispatch indirect)
-        dst_access += { .INDIRECT_COMMAND_READ }
-    }
-    if .Descriptors in hazards
-    {
-        // When descriptors are updated, ensure visibility
-        src_access += { .SHADER_WRITE }
-        dst_access += { .SHADER_READ }
-    }
-    if .Depth_Stencil in hazards
-    {
-        // Depth/stencil attachment synchronization
-        src_access += { .DEPTH_STENCIL_ATTACHMENT_WRITE }
-        dst_access += { .DEPTH_STENCIL_ATTACHMENT_READ, .DEPTH_STENCIL_ATTACHMENT_WRITE }
-    }
-    if .BVHs in hazards
-    {
-        src_access += { .ACCELERATION_STRUCTURE_WRITE_KHR }
-        dst_access += { .ACCELERATION_STRUCTURE_READ_KHR }
-    }
-
-    // If no specific hazards, use generic memory barrier
-    if card(hazards) == 0
-    {
-        src_access = { .MEMORY_WRITE }
-        dst_access = { .MEMORY_READ, .MEMORY_WRITE }
-    }
-
-    barrier := vk.MemoryBarrier {
-        sType = .MEMORY_BARRIER,
-        srcAccessMask = src_access,
-        dstAccessMask = dst_access,
-    }
-    vk.CmdPipelineBarrier(vk_cmd_buf, vk_before, vk_after, {}, 1, &barrier, 0, nil, 0, nil)
+    (cmd_buf_info.encoder.base)->barrierAfterStages(mtl_after, mtl_before, {})
 }
 
 _cmd_set_shaders :: proc(cmd_buf: Command_Buffer, vert_shader: Shader, frag_shader: Shader, loc := #caller_location)
@@ -1922,6 +2036,86 @@ _cmd_set_shaders :: proc(cmd_buf: Command_Buffer, vert_shader: Shader, frag_shad
         if !ok do return
     }
 
+    // TODO: For the render pipeline, hold off on creating it until we get to a draw
+    // call. Until we call a draw procedure, we'll propagate the values passed into
+    // these procedure, '_cmd_set_depth_state', '_cmd_set_raster_state', and so on.
+    // 
+    // Then for the Render_Pipeline_Handle, we'll unfortunately have to make it
+    // a hash of the current set of configurations. We'll do a map[u64]^mtl.RenderPipelineState,
+    // for the caching. 
+    // 
+    // For the hash we'll use, we can just do something like this:
+    // ```
+    // import "core:hash/xxhash"
+    // import "core:mem"
+    // 
+    // My_Struct :: struct { ... }
+    // s: My_Struct = ...
+    // 
+    // bytes := mem.slice_from_ptr(cast([^]u8)&s, size_of(My_Struct))
+	//
+	// hash: u64 = xxhash.XXH64(bytes)
+    // ```
+    // 
+    // IMPORTANT: Don't forget to include sync guards to prevent multi-threading
+    // issues when it comes time to append or look-up render pipelines from the 
+    // cache.
+    // 
+    // We can apply the same with compute pipelines if necessary. However, I feel
+    // it most likely won't be. Compared to the render pipeline, the compute pass
+    // shouldn't have as many inline configuration options.
+
+    cmd_buf_info, cmd_sync := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
+
+    cmd_buf_info.vert_shader = vert_shader
+    cmd_buf_info.frag_shader = frag_shader
+
+    cmd_buf_info.graphics_shader_source_location = loc
+
+    /*
+    pipeline_handle: Render_Pipeline_Handle
+    pipeline_handle[0] = rawptr(vert_shader)
+    pipeline_handle[1] = rawptr(frag_shader)
+
+    render_pipeline: ^mtl.RenderPipelineState
+    if pipeline_handle not_in ctx.render_pipelines
+    {
+        vert_shader := pool_get(&ctx.shaders, vert_shader)
+        frag_shader := pool_get(&ctx.shaders, frag_shader)
+
+        assert(!vert_shader.is_compute, "Expected the first shader given to be a vertex shader. Instead, we got a compute shader.", loc = loc)
+        assert(!frag_shader.is_compute, "Expected the second shader given to be a fragment shader. Instead, we got a compute shader.", loc = loc)
+        assert(vert_shader.graphics_type == .Vertex, "Expected the first shader given to be a vertex shader. Instead, we got a fragment shader.", loc = loc)
+        assert(frag_shader.graphics_type == .Fragment, "Expected the second shader given to be a fragment shader. Instead, we got a vertex shader.", loc = loc)
+
+        pipe_desc := objc_alloc(mtl.MTL4RenderPipelineDescriptor)
+        defer pipe_desc->release()
+
+        pipe_desc->setVertexFunctionDescriptor(vert_shader.handle)
+        pipe_desc->setFragmentFunctionDescriptor(frag_shader.handle)
+
+        // TODO: Figure out a proper value for this.
+        pipe_desc->setRasterSampleCount(1)
+
+        compile_task_options := objc_alloc(mtl.MTL4CompilerTaskOptions)
+        defer compile_task_options->release()
+        
+        err: ^ns.Error
+        render_pipeline = (ctx.shader_compiler)->newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(pipe_desc, compile_task_options, &err)
+
+        mtl_ensure(err, "Unable to create new render pipeline with given shaders on line %v, col %v, in '%v'", loc.line, loc.column, loc.file_path)
+
+        ctx.render_pipelines[pipeline_handle] = render_pipeline
+    }
+    else 
+    {
+        render_pipeline, _ = ctx.render_pipelines[pipeline_handle]
+    }
+
+    encoder->setRenderPipelineState(render_pipeline)
+    */
+
+    /*
     cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
     vert_shader := pool_get(&ctx.shaders, vert_shader)
     frag_shader := pool_get(&ctx.shaders, frag_shader)
@@ -1934,6 +2128,7 @@ _cmd_set_shaders :: proc(cmd_buf: Command_Buffer, vert_shader: Shader, frag_shad
     to_bind := []vk.ShaderEXT { vk_vert_shader, vk_frag_shader }
     assert(len(shader_stages) == len(to_bind))
     vk.CmdBindShadersEXT(vk_cmd_buf, u32(len(shader_stages)), raw_data(shader_stages), raw_data(to_bind))
+    */
 }
 
 _cmd_set_depth_state :: proc(cmd_buf: Command_Buffer, state: Depth_State, loc := #caller_location)
@@ -1945,16 +2140,9 @@ _cmd_set_depth_state :: proc(cmd_buf: Command_Buffer, state: Depth_State, loc :=
         if !ok do return
     }
 
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
+    cmd_buf_info, cmd_sync := pool_get(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
 
-    vk_cmd_buf := cmd_buf.handle
-
-    vk.CmdSetDepthCompareOp(vk_cmd_buf, to_vk_compare_op(state.compare))
-    vk.CmdSetDepthTestEnable(vk_cmd_buf, .Read in state.mode)
-    vk.CmdSetDepthWriteEnable(vk_cmd_buf, .Write in state.mode)
-    vk.CmdSetDepthBiasEnable(vk_cmd_buf, false)
-    vk.CmdSetDepthClipEnableEXT(vk_cmd_buf, true)
-    vk.CmdSetStencilTestEnable(vk_cmd_buf, false)
+    cmd_buf_info.depth_state = state
 }
 
 _cmd_set_raster_state :: proc(cmd_buf: Command_Buffer, state: Raster_State, loc := #caller_location)
@@ -1966,12 +2154,9 @@ _cmd_set_raster_state :: proc(cmd_buf: Command_Buffer, state: Raster_State, loc 
         if !ok do return
     }
 
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf.handle
+    cmd_buf_info, cmd_sync := pool_get(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
 
-    vk.CmdSetPrimitiveTopology(vk_cmd_buf, to_vk_topology(state.topology))
-    vk.CmdSetCullMode(vk_cmd_buf, to_vk_cull_mode(state.cull_mode))
-    vk.CmdSetAlphaToCoverageEnableEXT(vk_cmd_buf, b32(state.alpha_to_coverage))
+    cmd_buf_info.raster_state = state
 }
 
 _cmd_set_blend_state :: proc(cmd_buf: Command_Buffer, state: Blend_State, loc := #caller_location)
@@ -1983,23 +2168,9 @@ _cmd_set_blend_state :: proc(cmd_buf: Command_Buffer, state: Blend_State, loc :=
         if !ok do return
     }
 
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf.handle
+    cmd_buf_info, cmd_sync := pool_get(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
 
-    enable_b32 := b32(state.enable)
-    vk.CmdSetColorBlendEnableEXT(vk_cmd_buf, 0, 1, &enable_b32)
-
-    vk.CmdSetColorBlendEquationEXT(vk_cmd_buf, 0, 1, &vk.ColorBlendEquationEXT {
-        srcColorBlendFactor = to_vk_blend_factor(state.src_color_factor),
-        dstColorBlendFactor = to_vk_blend_factor(state.dst_color_factor),
-        colorBlendOp        = to_vk_blend_op(state.color_op),
-        srcAlphaBlendFactor = to_vk_blend_factor(state.src_alpha_factor),
-        dstAlphaBlendFactor = to_vk_blend_factor(state.dst_alpha_factor),
-        alphaBlendOp        = to_vk_blend_op(state.alpha_op),
-    })
-
-    color_write_mask := transmute(vk.ColorComponentFlags) cast(u32) transmute(u8) state.color_write_mask
-    vk.CmdSetColorWriteMaskEXT(vk_cmd_buf, 0, 1, &color_write_mask)
+    cmd_buf_info.blend_state = state
 }
 
 _cmd_set_viewport :: proc(cmd_buf: Command_Buffer, viewport: Viewport, loc := #caller_location)
@@ -2015,9 +2186,9 @@ _cmd_set_viewport :: proc(cmd_buf: Command_Buffer, viewport: Viewport, loc := #c
         if !ok do return
     }
 
-    vk_cmd_buf := pool_get(&ctx.command_buffers, cmd_buf).handle
-    vk_viewport := to_vk_viewport(viewport)
-    vk.CmdSetViewportWithCount(vk_cmd_buf, 1, &vk_viewport)
+    cmd_buf_info, cmd_sync := pool_get(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
+
+    cmd_buf_info.viewport = viewport
 }
 
 _cmd_set_scissor :: proc(cmd_buf: Command_Buffer, scissor: Rect_2D, loc := #caller_location)
@@ -2029,9 +2200,9 @@ _cmd_set_scissor :: proc(cmd_buf: Command_Buffer, scissor: Rect_2D, loc := #call
         if !ok do return
     }
 
-    vk_cmd_buf := pool_get(&ctx.command_buffers, cmd_buf).handle
-    vk_scissor := to_vk_rect_2D(scissor)
-    vk.CmdSetScissorWithCount(vk_cmd_buf, 1, &vk_scissor)
+    cmd_buf_info, cmd_sync := pool_get(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
+
+    cmd_buf_info.scissor = scissor
 }
 
 _cmd_set_compute_shader :: proc(cmd_buf: Command_Buffer, compute_shader: Shader, loc := #caller_location)
@@ -2044,18 +2215,71 @@ _cmd_set_compute_shader :: proc(cmd_buf: Command_Buffer, compute_shader: Shader,
         if !ok do return
     }
 
+    encoder := mtl_get_compute_encoder(cmd_buf, loc = loc)
+
     shader_info := pool_get(&ctx.shaders, compute_shader)
-    vk_shader_info := shader_info.handle
+    mtl_shader_info := shader_info.handle
 
-    cmd_buf_info, r_lock := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(r_lock)
-    vk_cmd_buf := cmd_buf_info.handle
+    compute_pipeline: ^mtl.ComputePipelineState
+    if sync.guard(&ctx.lock)
+    {
+        pipeline_handle := Compute_Pipeline_Handle(compute_shader)
+        
+        if pipeline_handle not_in ctx.compute_pipelines
+        {
+            assert(shader_info.is_compute, "Expected the shader given to be a compute shader. Instead, we got a vertex or fragment shader.", loc = loc)
 
-    shader_stages := []vk.ShaderStageFlags { { .COMPUTE } }
-    to_bind := []vk.ShaderEXT { vk_shader_info }
-    assert(len(shader_stages) == len(to_bind))
-    vk.CmdBindShadersEXT(vk_cmd_buf, u32(len(shader_stages)), raw_data(shader_stages), raw_data(to_bind))
+            pipe_desc := objc_alloc(mtl.MTL4ComputePipelineDescriptor)
+            defer pipe_desc->release()
 
-    cmd_buf_info.compute_shader = compute_shader
+            pipe_desc->setComputeFunctionDescriptor(mtl_shader_info)
+
+            compile_task_options := objc_alloc(mtl.MTL4CompilerTaskOptions)
+            defer compile_task_options->release()
+
+            err: ^ns.Error
+            compute_pipeline = (ctx.shader_compiler)->newComputePipelineStateWithDescriptor_compilerTaskOptions_error(pipe_desc, compile_task_options, &err)
+
+            mtl_ensure(err, "Unable to create new compute pipeline with given compute shader.", loc = loc)
+            ctx.compute_pipelines[pipeline_handle] = compute_pipeline
+        }
+        else
+        {
+            compute_pipeline, _ = ctx.compute_pipelines[pipeline_handle]
+        }
+    }
+
+    encoder->setComputePipelineState(compute_pipeline)
+
+    if cmd_buf_info, cmd_lock := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(cmd_lock)
+    {
+        cmd_buf_info.compute_shader = compute_shader
+    }
+}
+
+@(private="file")
+mtl_push_constant :: proc(cmd_buf: Command_Buffer, constant: $T, loc := #caller_location)
+{
+    cmd_buf_info, cmd_sync := pool_get(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
+
+    if !check_ptr(cnd_buf_info.push_constant_buffer, "cmd_buf.push_constant_buffer", loc)
+    {
+        ensure(false, "Unable to push additional data to the internal 'push constant' buffer of the current command buffer. Too many things have been passed in.", loc = loc)
+    }
+
+    constant := constant
+
+    mem.copy(
+        cmd_buf_info.push_constant_buffer.cpu,
+        &constant,
+        size_of(T)
+    )
+
+    push_constant_gpu_address := cast(mtl.GPUAddress) cast(uintptr) cmd_buf_info.push_constant_buffer.gpu.ptr
+
+    (cmd_buf_info.argument_table)->setAddress_atIndex(push_constant_gpu_address, 0)
+    
+    cmd_buf_info.push_constant_buffer = ptr_advance(cmd_buf_info.push_constant_buffer, size_of(T))
 }
 
 _cmd_dispatch :: proc(cmd_buf: Command_Buffer, compute_data: gpuptr, num_groups_x: u32, num_groups_y: u32 = 1, num_groups_z: u32 = 1, loc := #caller_location)
@@ -2069,14 +2293,16 @@ _cmd_dispatch :: proc(cmd_buf: Command_Buffer, compute_data: gpuptr, num_groups_
         if !ok do return
     }
 
-    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf_info.handle
+    encoder := mtl_get_compute_encoder(cmd_buf, loc = loc)
 
     push_constants := Compute_Shader_Push_Constants {
         compute_data = compute_data.ptr,
     }
 
-    vk.CmdPushConstants(vk_cmd_buf, ctx.common_pipeline_layout_compute, { .COMPUTE }, 0, size_of(Compute_Shader_Push_Constants), &push_constants)
+    mtl_push_constant(cmd_buf, push_constants)
+    
+    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
+    mtl_cmd_buf := cmd_buf_info.handle
 
     vk.CmdDispatch(vk_cmd_buf, num_groups_x, num_groups_y, num_groups_z)
 }
@@ -2118,9 +2344,19 @@ _cmd_begin_render_pass :: proc(cmd_buf: Command_Buffer, desc: Render_Pass_Desc, 
         if !ok do return
     }
 
-    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf_info.handle
+    cmd_buf_info, cmd_sync := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
+    mtl_cmd_buf := cmd_buf_info.handle
 
+    if cmd_buf_info.encoder_type == .Compute
+    {
+        (cmd_buf_info.encoder.compute)->endEncoding()
+    }
+
+    render_pass_desc := objc_alloc(mtl.MTL4RenderPassDescriptor)
+    defer render_pass_desc->release()
+
+    color_attachments := render_pass_desc->colorAttachments()
+    
     scratch, _ := acquire_scratch()
 
     // Compute sample count
@@ -2133,19 +2369,7 @@ _cmd_begin_render_pass :: proc(cmd_buf: Command_Buffer, desc: Render_Pass_Desc, 
             sample_count = max(sample_count, desc.depth_attachment.?.texture.sample_count)
         }
     }
-
-    vk_color_attachments := make([]vk.RenderingAttachmentInfo, len(desc.color_attachments), allocator = scratch)
-    for &vk_attach, i in vk_color_attachments {
-        vk_attach = to_vk_render_attachment(desc.color_attachments[i])
-    }
-
-    vk_depth_attachment: vk.RenderingAttachmentInfo
-    vk_depth_attachment_ptr: ^vk.RenderingAttachmentInfo
-    if desc.depth_attachment != nil
-    {
-        vk_depth_attachment = to_vk_render_attachment(desc.depth_attachment.?)
-        vk_depth_attachment_ptr = &vk_depth_attachment
-    }
+    cmd_buf_info.render_sample_count = sample_count
 
     width := desc.render_area_size.x
     if width == {} {
@@ -2160,86 +2384,80 @@ _cmd_begin_render_pass :: proc(cmd_buf: Command_Buffer, desc: Render_Pass_Desc, 
         layer_count = 1
     }
 
-    rendering_info := vk.RenderingInfo {
-        sType = .RENDERING_INFO,
-        renderArea = {
-            offset = { desc.render_area_offset.x, desc.render_area_offset.y },
-            extent = { width, height }
-        },
-        layerCount = layer_count,
-        colorAttachmentCount = u32(len(vk_color_attachments)),
-        pColorAttachments = raw_data(vk_color_attachments),
-        pDepthAttachment = vk_depth_attachment_ptr,
+    cmd_buf_info.scissor = {
+        offset = desc.render_area_offset,
+        size = { width, height },
     }
-    vk.CmdBeginRendering(vk_cmd_buf, &rendering_info)
 
-    // Blend state
-    vk.CmdSetStencilTestEnable(vk_cmd_buf, false)
-    color_attachment_count := u32(len(vk_color_attachments))
-    if color_attachment_count > 0 {
-        // Set blend enable for all attachments
-        blend_enables := make([]b32, color_attachment_count, allocator = scratch)
-        for i in 0 ..< color_attachment_count {
-            blend_enables[i] = false
-        }
-        vk.CmdSetColorBlendEnableEXT(vk_cmd_buf, 0, color_attachment_count, raw_data(blend_enables))
-
-        // Set color write mask for all attachments
-        color_mask := vk.ColorComponentFlags { .R, .G, .B, .A }
-        color_masks := make([]vk.ColorComponentFlags, color_attachment_count, allocator = scratch)
-        for i in 0 ..< color_attachment_count {
-            color_masks[i] = color_mask
-        }
-        vk.CmdSetColorWriteMaskEXT(vk_cmd_buf, 0, color_attachment_count, raw_data(color_masks))
+    cmd_buf_info.viewport = {
+        origin = { 0, 0 },
+        size = { f32(width), f32(height) },
+        depth_min = 0,
+        depth_max = 0,
     }
+
+    cmd_buf_info.raster_state = {
+        topology = .Triangle_List,
+        cull_mode = .Cull_CW,
+        alpha_to_coverage = false,
+    }
+
+    cmd_buf_info.depth_state = {
+        mode = {},
+        compare = .Less,
+    }
+
+    cmd_buf_info.blend_state = {
+        enable = false,
+        color_op = .Add,
+        src_color_factor = .Src_Alpha,
+        dst_color_factor = .One_Minus_Src_Alpha,
+        alpha_op = .Add,
+        src_alpha_factor = .One,
+        dst_alpha_factor = .One_Minus_Src_Alpha,
+        color_write_mask = { .R, .G, .B, .A }
+    }
+
+    render_pass_desc->setDefaultRasterSampleCount(ns.UInteger(sampler_count))
+    render_pass_desc->setRenderTargetArrayLength(ns.UInteger(layer_count))
+
+    for attach, i in desc.color_attachments
+    {
+        mtl_attach := color_attachments->objectAtIndexedSubscript(ns.UInteger(i))
+        mtl_update_render_pass_attachment(attach, mtl_attach)
+
+        mtl_attach->setClearColor({ 
+            f64(attach.clear_color.r),
+            f64(attach.clear_color.g),
+            f64(attach.clear_color.b),
+            f64(attach.clear_color.a),
+        })
+    }
+
+    if depth_attach, has_attach := desc.depth_attachment.?; has_attach
+    {
+        mtl_depth_attach := render_pass_desc->depthAttachment()
+        mtl_update_render_pass_attachment(depth_attach, mtl_depth_attach)
+    }
+
+    if stencil_attach, has_attach := desc.stencil_attachment.?; has_attach
+    {
+        mtl_stencil_attach := render_pass_desc->stencilAttachment()
+        mtl_update_render_pass_attachment(stencil_attach, mtl_stencil_attach)
+    }
+
+    cmd_buf_info.encoder.render = mtl_cmd_buf->renderCommandEncoderWithDescriptor_(render_pass_desc)
+    cmd_buf_info.encoder_type = .Render
 
     // Raster state
-    vk.CmdSetRasterizationSamplesEXT(vk_cmd_buf, to_vk_sample_count(sample_count))
-    vk.CmdSetPrimitiveTopology(vk_cmd_buf, .TRIANGLE_LIST)
-    vk.CmdSetPolygonModeEXT(vk_cmd_buf, .FILL)
-    vk.CmdSetCullMode(vk_cmd_buf, { .BACK })
-    vk.CmdSetFrontFace(vk_cmd_buf, .COUNTER_CLOCKWISE)
+    (cmd_buf_info.encoder.render)->setFrontFacingWinding(.CounterClockwise)
+    (cmd_buf_info.encoder.render)->setTriangleFillMode(.Fill)
+    (cmd_buf_info.encoder.render)->setDepthClipMode(.Clip)
 
-    // Depth state
-    vk.CmdSetDepthCompareOp(vk_cmd_buf, .LESS)
-    vk.CmdSetDepthTestEnable(vk_cmd_buf, false)
-    vk.CmdSetDepthWriteEnable(vk_cmd_buf, false)
-    vk.CmdSetDepthBiasEnable(vk_cmd_buf, false)
-    vk.CmdSetDepthClipEnableEXT(vk_cmd_buf, true)
-
-    // Viewport
-    viewport := vk.Viewport {
-        x = 0, y = 0,
-        width = f32(width), height = f32(height),
-        minDepth = 0.0, maxDepth = 1.0,
-    }
-    vk.CmdSetViewportWithCount(vk_cmd_buf, 1, &viewport)
-    scissor := vk.Rect2D {
-        offset = {
-            x = 0, y = 0
-        },
-        extent = {
-            width = width, height = height,
-        }
-    }
-    vk.CmdSetScissorWithCount(vk_cmd_buf, 1, &scissor)
-    vk.CmdSetRasterizerDiscardEnable(vk_cmd_buf, false)
-    vk.CmdSetColorBlendEquationEXT(vk_cmd_buf, 0, 1, &vk.ColorBlendEquationEXT {
-        srcColorBlendFactor = .SRC_ALPHA,
-        dstColorBlendFactor = .ONE_MINUS_SRC_ALPHA,
-        colorBlendOp        = .ADD,
-        srcAlphaBlendFactor = .ONE,
-        dstAlphaBlendFactor = .ONE_MINUS_SRC_ALPHA,
-        alphaBlendOp        = .ADD,
-    })
-
-    // Unused
-    vk.CmdSetVertexInputEXT(vk_cmd_buf, 0, nil, 0, nil)
-    vk.CmdSetPrimitiveRestartEnable(vk_cmd_buf, false)
-
-    sample_mask := vk.SampleMask(0xFF)
-    vk.CmdSetSampleMaskEXT(vk_cmd_buf, to_vk_sample_count(sample_count), &sample_mask)
-    vk.CmdSetAlphaToCoverageEnableEXT(vk_cmd_buf, false)
+    // NOTE: Setting this to nil to ensure we receive proper errors if we attempt
+    // to invoke any compute shader related calls after the render pass (or even
+    // during it)
+    cmd_buf_info.compute_shader = nil
 }
 
 _cmd_end_render_pass :: proc(cmd_buf: Command_Buffer, loc := #caller_location)
@@ -2251,9 +2469,143 @@ _cmd_end_render_pass :: proc(cmd_buf: Command_Buffer, loc := #caller_location)
         if !ok do return
     }
 
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf.handle
-    vk.CmdEndRendering(vk_cmd_buf)
+    encoder := mtl_get_render_encoder(cmd_buf, loc = loc)
+
+    encoder->endEncoding()
+
+    cmd_buf_info, cmd_sync := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(cmd_sync)
+
+    cmd_buf_info.encoder_type = .None
+}
+
+@(private="file")
+mtl_set_up_render_state :: proc(cmd_buf_info: Command_Buffer_Info, encoder: ^mtl.MTL4RenderCommandEncoder, loc := #caller_location)
+{
+    pipeline_handle := hash_cmd_buf_render_state(cmd_buf_info)
+
+    render_pipeline: ^mtl.RenderPipelineState
+    depth_stencil_state: ^mtl.DepthStencilState
+
+    if sync.guard(&ctx.lock)
+    {
+        if pipeline_handle not_in ctx.render_pipelines
+        {
+            assert(
+                cmf_buf_info.vert_shader != nil &&
+                cmd_buf_info.frag_shader != nil,
+                "Before you can issue this draw call, You have to set the vertex and fragment shaders that'll be used with `cmd_set_shaders`!",
+                loc = loc
+            )
+            
+            vert_shader := pool_get(&ctx.shaders, cmd_buf_info.vert_shader.? or_else panic("You haven't set the vertex shader for this render pass!"))
+            frag_shader := pool_get(&ctx.shaders, cmd_buf_info.frag_shader.? or_else panic("You haven't set hte fragment shader for this render pass!"))
+
+            shader_source_location := cmd_buf_info.graphics_shader_source_location
+    
+            assert(!vert_shader.is_compute, "Expected the first shader given to be a vertex shader. Instead, we got a compute shader.", loc = shader_source_location)
+            assert(!frag_shader.is_compute, "Expected the second shader given to be a fragment shader. Instead, we got a compute shader.", loc = shader_source_location)
+            assert(vert_shader.graphics_type == .Vertex, "Expected the first shader given to be a vertex shader. Instead, we got a fragment shader.", loc = shader_source_location)
+            assert(frag_shader.graphics_type == .Fragment, "Expected the second shader given to be a fragment shader. Instead, we got a vertex shader.", loc = shader_source_location)
+    
+            pipe_desc := objc_alloc(mtl.MTL4RenderPipelineDescriptor)
+            defer pipe_desc->release()
+    
+            pipe_desc->setVertexFunctionDescriptor(vert_shader.handle)
+            pipe_desc->setFragmentFunctionDescriptor(frag_shader.handle)
+    
+            pipe_desc->setRasterSampleCount(ns.UInteger(cmd_buf_info.render_sample_count))
+
+            pipe_desc->setAlphaToCoverageState(.Enabled if cmd_buf_info.raster_state.alpha_to_coverage else .Disabled)
+
+            // Set up blend state
+            {
+                color_attachments := pipe_desc->colorAttachments()
+                blend_attach := color_attachments->objectAtIndexedSubscript(0)
+                blend_state := cmd_buf_info.blend_state
+    
+                blend_attach->setBlendingState(.Enabled if blend_state.enable else .Disabled)
+
+                // RGB Config
+                blend_attach->setSourceRGBBlendFactor(to_mtl_blend_factor(blend_state.src_color_factor))
+                blend_attach->setDestinationRGBBlendFactor(to_mtl_blend_factor(blend_state.dst_color_factor))
+                blend_attach->setRgbBlendOperation(to_mtl_blend_op(blend_state.color_op))
+
+                // Alpha Config
+                blend_attach->setSourceAlphaBlendFactor(to_mtl_blend_factor(blend_state.src_alpha_factor))
+                blend_attach->setDestinationAlphaBlendFactor(to_mtl_blend_factor(blend_state.dst_alpha_factor))
+                blend_attach->setAlphaBlendOperation(to_mtl_blend_op(blend_state.alpha_op))
+
+                blend_attach->setWriteMask(to_mtl_write_mask(blend_state.color_write_mask))
+            }
+
+            // NOTE: Needed for compilation, but not really useful for our purposes.
+            compile_task_options := objc_alloc(mtl.MTL4CompilerTaskOptions)
+            defer compile_task_options->release()
+            
+            err: ^ns.Error
+            render_pipeline = (ctx.shader_compiler)->newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(pipe_desc, compile_task_options, &err)
+    
+            mtl_ensure(err, "Unable to create new render pipeline with given shaders on line %v, col %v, in '%v'", loc.line, loc.column, loc.file_path)
+    
+            ctx.render_pipelines[pipeline_handle] = render_pipeline
+        }
+        else
+        {
+            render_pipeline, _ = ctx.render_pipelines[pipeline_handle]
+        }
+
+        if cmd_buf_info.depth_state not_in ctx.depth_stencil_states
+        {
+            depth_stencil_desc := objc_alloc(mtl.DepthStencilDescriptor)
+            defer depth_stencil_desc->release()
+
+            depth_state := cmd_buf_info.depth_state
+
+            // NOTE: Unlike in vulkan, there does not exist a separate procedure
+            // used to mark if depth testing is enabled. Instead, metal makes use 
+            // of the '.Always' flag to indicate that it's disabled, simply through 
+            // the logically conclusion that if everything passes then it's not 
+            // doing it's main job, marking it effectively as disabled.
+            depth_stencil_desc->setDepthCompareFunction(
+                to_mtl_compare_op(cmd_buf_info.depth_state.compare) if .Read in depth_state.mode else .Always
+            )
+            depth_stencil_desc->setDepthWriteEnabled(.Write in depth_state.mode)
+
+            depth_stencil_state := (ctx.device)->newDepthStencilStateWithDescriptor(depth_stencil_desc)
+
+            ctx.depth_stencil_states[depth_state] = depth_stencil_state
+        }
+        else
+        {
+            depth_stencil_state, _ = ctx.depth_stencil_states[cmd_buf_info.depth_state]
+        }
+    }
+
+    encoder->setCullMode(to_mtl_cull_mode(cmd_buf_info.raster_state.cull_mode))
+
+    encoder->setRenderPipelineState(render_pipeline)
+    encoder->setDepthStencilState(depth_stencil_state)
+
+    encoder->setViewport(mtl.Viewport {
+        originX = f64(cmd_buf_info.viewport.origin.x),
+        originY = f64(cmd_buf_info.viewport.origin.y),
+        
+        width   = f64(cmd_buf_info.viewport.size.x),
+        height  = f64(cmd_buf_info.viewport.size.y),
+
+        znear   = f64(cmd_buf_info.viewport.depth_min),
+        zfar    = f64(cmd_buf_info.viewport.depth_max),
+    })
+
+    encoder->setScissorRect(mtl.ScissorRect {
+        x      = ns.UInteger(cmd_buf_info.scissor.offset.x),
+        y      = ns.UInteger(cmd_buf_info.scissor.offset.y),
+        
+        width  = ns.UInteger(cmd_buf_info.scissor.size.x),
+        height = ns.UInteger(cmd_buf_info.scissor.size.y),
+    })
+
+    encoder->setArgumentTable(cmd_buf_info.argument_table, { .StageVertex, .StageFragment })
 }
 
 _cmd_draw :: proc(cmd_buf: Command_Buffer, vertex_data, fragment_data: gpuptr,
@@ -2268,17 +2620,25 @@ _cmd_draw :: proc(cmd_buf: Command_Buffer, vertex_data, fragment_data: gpuptr,
         if !ok do return
     }
 
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf.handle
+    encoder := mtl_get_render_encoder(cmd_buf, loc = loc)
+
+    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
 
     push_constants := Graphics_Shader_Push_Constants {
         vert_data = vertex_data.ptr,
         frag_data = fragment_data.ptr,
         indirect_data = nil,
     }
-    vk.CmdPushConstants(vk_cmd_buf, ctx.common_pipeline_layout_graphics, { .VERTEX, .FRAGMENT }, 0, size_of(Graphics_Shader_Push_Constants), &push_constants)
+    mtl_push_constant(cmd_buf, push_constants, loc = loc)
+    mtl_set_up_render_state(cmd_buf_info, encoder, loc = loc)
 
-    vk.CmdDraw(vk_cmd_buf, vertex_count, instance_count, 0, 0)
+    encoder->drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+        to_mtl_topology(cmd_buf_info.raster_state.topology),
+        0,
+        ns.UInteger(vertex_count),
+        ns.UInteger(instance_count),
+        0
+    )
 }
 
 _cmd_draw_indexed_raw :: proc(cmd_buf: Command_Buffer, vertex_data, fragment_data, indices: gpuptr,
@@ -2366,6 +2726,40 @@ _cmd_draw_indexed_indirect_multi_raw :: proc(cmd_buf: Command_Buffer, vertex_dat
     arguments_buf, arguments_offset, _ := get_buf_offset_from_gpu_ptr(indirect_arguments)
     draw_count_buf, draw_count_offset, _ := get_buf_offset_from_gpu_ptr(draw_count)
 
+    /*
+        TODO: For this, here is what I'm thinking:
+    
+        I'll likely have to record a simple draw call making use of the 
+        indirect argument buffer, that'll then be stored in a metal
+        indirect command buffer (icb). Then to execute it X times from the
+        GPU, like we can in Vulkan, we'll have to change the count buffer
+        to be structured like this:
+
+        On metal:
+        ```
+        Draw_Indirect_Count :: struct
+        {
+            _: u64,
+            count: u64,
+        }
+        ```
+
+        On vulkan:
+        ```
+        Draw_Indirect_Count :: struct
+        {
+            count: u32,
+        }
+        ```
+
+        With maybe a specific type to help "ground" the type you're
+        talking about when casting to the 'count' field on this struct.
+
+        This'll prevent us from having to do a blit to sync between the
+        vulkan and metal version, as the struct detailed above for metal
+        is required for it to be valid (it has to map to a NSRange)
+    */
+    
     // vertex_data and fragment_data are shared data for vertex and fragment shaders
     // indirect_arguments points to the unified indirect data array containing both command and user data
     // The stride is the size of the combined struct { IndirectDrawCommand cmd; UserData data; }
@@ -2564,155 +2958,6 @@ mtl_ensure :: proc(err: ^ns.Error, msg := "", args: ..any, location := #caller_l
 }
 
 @(private="file")
-vk_check :: proc(result: vk.Result, location := #caller_location)
-{
-    if result != .SUCCESS {
-        fatal_error("Vulkan failure: %v", result, location = location)
-    }
-}
-
-@(private="file")
-vk_debug_callback :: proc "system" (severity: vk.DebugUtilsMessageSeverityFlagsEXT,
-                                    types: vk.DebugUtilsMessageTypeFlagsEXT,
-                                    callback_data: ^vk.DebugUtilsMessengerCallbackDataEXT,
-                                    user_data: rawptr) -> b32
-{
-    context = runtime.default_context()
-    context.logger = vk_logger
-
-    level: log.Level
-    if .ERROR in severity        do level = .Error
-    else if .WARNING in severity do level = .Warning
-    else if .INFO in severity    do level = .Info
-    else                         do level = .Debug
-    log.log(level, callback_data.pMessage)
-
-    return false
-}
-
-@(private="file")
-create_swapchain :: proc(width: u32, height: u32, frames_in_flight: u32) -> Swapchain
-{
-    scratch, _ := acquire_scratch()
-
-    res: Swapchain
-
-    surface_caps: vk.SurfaceCapabilitiesKHR
-    vk_check(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(ctx.phys_device, ctx.surface, &surface_caps))
-
-    image_count := max(max(2, surface_caps.minImageCount), frames_in_flight)
-    if surface_caps.maxImageCount != 0 do assert(image_count <= surface_caps.maxImageCount)
-
-    surface_format_count: u32
-    vk_check(vk.GetPhysicalDeviceSurfaceFormatsKHR(ctx.phys_device, ctx.surface, &surface_format_count, nil))
-    surface_formats := make([]vk.SurfaceFormatKHR, surface_format_count, allocator = scratch)
-    vk_check(vk.GetPhysicalDeviceSurfaceFormatsKHR(ctx.phys_device, ctx.surface, &surface_format_count, raw_data(surface_formats)))
-
-    surface_format := surface_formats[0]
-    for candidate in surface_formats
-    {
-        if candidate == { .B8G8R8A8_UNORM, .SRGB_NONLINEAR }
-        {
-            surface_format = candidate
-            break
-        }
-    }
-
-    present_mode_count: u32
-    vk_check(vk.GetPhysicalDeviceSurfacePresentModesKHR(ctx.phys_device, ctx.surface, &present_mode_count, nil))
-    present_modes := make([]vk.PresentModeKHR, present_mode_count, allocator = scratch)
-    vk_check(vk.GetPhysicalDeviceSurfacePresentModesKHR(ctx.phys_device, ctx.surface, &present_mode_count, raw_data(present_modes)))
-
-    present_mode := vk.PresentModeKHR.FIFO
-    for candidate in present_modes {
-        if candidate == .MAILBOX {
-            present_mode = candidate
-            break
-        }
-    }
-
-    res.width = width
-    res.height = height
-
-    swapchain_ci := vk.SwapchainCreateInfoKHR {
-        sType = .SWAPCHAIN_CREATE_INFO_KHR,
-        surface = ctx.surface,
-        minImageCount = image_count,
-        imageFormat = surface_format.format,
-        imageColorSpace = surface_format.colorSpace,
-        imageExtent = { res.width, res.height },
-        imageArrayLayers = 1,
-        imageUsage = { .COLOR_ATTACHMENT },
-        preTransform = surface_caps.currentTransform,
-        compositeAlpha = { .OPAQUE },
-        presentMode = present_mode,
-        clipped = true,
-    }
-    vk_check(vk.CreateSwapchainKHR(ctx.device, &swapchain_ci, nil, &res.handle))
-
-    vk_check(vk.GetSwapchainImagesKHR(ctx.device, res.handle, &image_count, nil))
-    res.images = make([]vk.Image, image_count, context.allocator)
-    res.texture_handles = make([]Texture_Handle, image_count, context.allocator)
-    vk_check(vk.GetSwapchainImagesKHR(ctx.device, res.handle, &image_count, raw_data(res.images)))
-
-    res.image_views = make([]vk.ImageView, image_count, context.allocator)
-    for image, i in res.images
-    {
-        image_view_ci := vk.ImageViewCreateInfo {
-            sType = .IMAGE_VIEW_CREATE_INFO,
-            image = image,
-            viewType = .D2,
-            format = surface_format.format,
-            subresourceRange = {
-                aspectMask = { .COLOR },
-                levelCount = 1,
-                layerCount = 1,
-            },
-        }
-        vk_check(vk.CreateImageView(ctx.device, &image_view_ci, nil, &res.image_views[i]))
-
-        tex_info := Texture_Info { handle = image }
-        append(&tex_info.views, Image_View_Info { info = image_view_ci, view = res.image_views[i] })
-        res.texture_handles[i] = pool_add(&ctx.textures, tex_info, {})
-    }
-
-    res.present_semaphores = make([]vk.Semaphore, image_count, context.allocator)
-
-    semaphore_ci := vk.SemaphoreCreateInfo { sType = .SEMAPHORE_CREATE_INFO }
-    for &semaphore in res.present_semaphores {
-        vk_check(vk.CreateSemaphore(ctx.device, &semaphore_ci, nil, &semaphore))
-    }
-
-    return res
-}
-
-@(private="file")
-destroy_swapchain :: proc(swapchain: ^Swapchain)
-{
-    delete(swapchain.images)
-    for semaphore in swapchain.present_semaphores {
-        vk.DestroySemaphore(ctx.device, semaphore, nil)
-    }
-    delete(swapchain.present_semaphores)
-    for image_view in swapchain.image_views {
-        vk.DestroyImageView(ctx.device, image_view, nil)
-    }
-    delete(swapchain.image_views)
-    vk.DestroySwapchainKHR(ctx.device, swapchain.handle, nil)
-
-    for handle in swapchain.texture_handles
-    {
-        tex_info := pool_get(&ctx.textures, handle)
-        // Vulkan objects for views are already destroyed by destroying swapchain.image_views
-        delete(tex_info.views)
-        pool_remove(&ctx.textures, handle)
-    }
-    delete(swapchain.texture_handles)
-
-    swapchain^ = {}
-}
-
-@(private="file")
 Swapchain :: struct
 {
     acquired: bool,
@@ -2723,7 +2968,7 @@ Swapchain :: struct
 }
 
 @(private="file")
-get_buf_offset_from_gpu_ptr :: proc(p: gpuptr) -> (buf: vk.Buffer, offset: u32, ok: bool)
+get_buf_offset_from_gpu_ptr :: proc(p: gpuptr) -> (buf: ^mtl.Buffer, offset: u32, ok: bool)
 {
     if p == {} do return {}, {}, false
 
@@ -2736,7 +2981,7 @@ get_buf_offset_from_gpu_ptr :: proc(p: gpuptr) -> (buf: vk.Buffer, offset: u32, 
 }
 
 @(private="file")
-get_buf_size_from_gpu_ptr :: proc(p: gpuptr) -> (size: vk.DeviceSize, ok: bool)
+get_buf_size_from_gpu_ptr :: proc(p: gpuptr) -> (size: u64, ok: bool)
 {
     if p == {} do return {}, false
 
@@ -2745,9 +2990,27 @@ get_buf_size_from_gpu_ptr :: proc(p: gpuptr) -> (size: vk.DeviceSize, ok: bool)
     return alloc_info.buf_size, true
 }
 
+@(private="file")
+reset_advanced_ptr :: proc(p: ^ptr) 
+{
+    if p == nil do return
+    if p^ == {} do return
+
+    alloc_impl := transmute(Alloc_Impl_Info) p._impl
+    alloc_info := pool_get(&ctx.allocs, alloc_impl.handle)
+
+    offset := uintptr(p.ptr) - uintptr(alloc_info.gpu)
+
+    if p.cpu != nil
+    {
+        p.cpu = rawptr(uintptr(p.cpu) - offset)
+    }
+    p.gpu.ptr = rawptr(uintptr(p.gpu.ptr) - offset)
+}
+
 // Command buffers
 @(private="file")
-vk_acquire_cmd_buf :: proc(queue: Queue) -> Command_Buffer
+mtl_acquire_cmd_buf :: proc(queue: Queue) -> Command_Buffer
 {
     tls_ctx := get_tls()
     sync.guard(&ctx.lock)
@@ -2758,39 +3021,50 @@ vk_acquire_cmd_buf :: proc(queue: Queue) -> Command_Buffer
 
         assert(!cmd_buf_info.recording)
 
-        vk_sem := pool_get(&ctx.semaphores, ctx.cmd_bufs_sem_vals[queue].sem)
-
-        current_semaphore_value: u64
-        vk_check(vk.GetSemaphoreCounterValue(ctx.device, vk_sem, &current_semaphore_value))
+        current_semaphore_value := _semaphore_get_value(ctx.cmd_bufs_sem_vals[queue].sem)
 
         if current_semaphore_value >= cmd_buf_info.timeline_value {
             cmd_buf_info.recording = true
             cmd_buf_info.queue = queue
-            cmd_buf_info.compute_shader = {}
+            cmd_buf_info.compute_shader = nil
             cmd_buf_info.thread_id = sync.current_thread_id()
+
+            reset_advanced_ptr(&cmd_buf_info.push_constant_buffer)
+
+            // NOTE: When we want to reuse a command buffer, we reset
+            // it's associated allocator to make use of the already existing
+            // memory pool present.
+            // 
+            // Additionally, if we reach this point, then the commands stored
+            // have most likely already been submitted and executed on the GPU.
+            (cmd_buf_info.allocator)->reset()
+            
             return handle.pool_handle
         } else {
             priority_queue.push(&tls_ctx.free_buffers[queue], handle)
         }
     }
 
-    cmd_buf_info := Command_Buffer_Info {
-        recording = true,
-        queue = queue,
-        compute_shader = {},
-        thread_id = sync.current_thread_id(),
-    }
-
     // If no free command buffer is available, create a new one
-    cmd_buf_ai := vk.CommandBufferAllocateInfo {
-        sType = .COMMAND_BUFFER_ALLOCATE_INFO,
-        commandPool = tls_ctx.pools[queue],
-        level = .PRIMARY,
-        commandBufferCount = 1,
-    }
+    // 
+    cmd_buf_info: Command_Buffer_Info 
+    cmd_buf_info.recording = true
+    cmd_buf_info.queue = queue
+    cmd_buf_info.compute_shader = nil
+    cmd_buf_info.thread_id = sync.current_thread_id()
+    cmd_buf_info.handle = (ctx.device)->newCommandBuffer()
+    cmd_buf_info.allocator = (ctx.device)->newCommandAllocator()
 
-    vk_check(vk.AllocateCommandBuffers(ctx.device, &cmd_buf_ai, &cmd_buf_info.handle))
+    argument_table_desc := objc_alloc(mtl.MTL4ArgumentTableDescriptor)
+    defer argument_table_desc->release()
 
+    // The extra (+1) is for the push constant buffer.
+    argument_table_desc->setMaxBufferBindCount(Total_Descriptor_Heap_Buffer_Count + 1)
+    
+    cmd_buf_info.argument_table = (ctx.device)->newArgumentTableWithDescriptor(argument_table_desc)
+
+    cmd_buf_info.push_constant_buffer = _mem_alloc_raw(Push_Constant_Buffer_Max_Size, 1, 1)
+    
     cmd_buf := pool_add(&ctx.command_buffers, cmd_buf_info, {})
     if cmd_buf_info_mut, r_lock := pool_get_mut(&ctx.command_buffers, cmd_buf); sync.guard(r_lock)
     {
@@ -2802,7 +3076,7 @@ vk_acquire_cmd_buf :: proc(queue: Queue) -> Command_Buffer
 }
 
 @(private="file")
-vk_submit_cmd_bufs :: proc(cmd_bufs: []Command_Buffer)
+mtl_submit_cmd_bufs :: proc(cmd_bufs: []Command_Buffer)
 {
     if len(cmd_bufs) <= 0 do return
 
@@ -2815,71 +3089,34 @@ vk_submit_cmd_bufs :: proc(cmd_bufs: []Command_Buffer)
         intr.volatile_store(&cmd_buf_info_mut.timeline_value, sync.atomic_add(&ctx.cmd_bufs_sem_vals[cmd_buf_info_mut.queue].val, 1) + 1)
     }
 
-    scratch, _ := acquire_scratch()
-    submit_infos := make([dynamic]vk.SubmitInfo, allocator = scratch)
-    queue: Queue
-    for cmd_buf in cmd_bufs
+    for cmd_buf in cmd_bufs 
     {
         cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
         cmd_buf_lock := pool_get_lock(&ctx.command_buffers, cmd_buf)
         sync.guard(cmd_buf_lock)
 
-        queue = cmd_buf_info.queue
-        queue_sem := ctx.cmd_bufs_sem_vals[queue].sem
-        vk_queue_sem := pool_get(&ctx.semaphores, queue_sem)
+        queue_sem := ctx.cmd_bufs_sem_vals[cmd_buf_info.queue].sem
+        mtl_queue_sem := pool_get(&ctx.semaphores, queue_sem)
+        mtl_queue := ctx.queues[cmd_buf_info.queue]
         assert(cmd_buf_info.recording)
         assert(cmd_buf_info.thread_id == sync.current_thread_id())
 
-        wait_count := len(cmd_buf_info.wait_sems)
-        signal_count := len(cmd_buf_info.signal_sems) + 1
-        wait_sems := make([]vk.Semaphore, wait_count, allocator = scratch)
-        wait_values := make([]u64, wait_count, allocator = scratch)
-        wait_stages := make([]vk.PipelineStageFlags, wait_count, allocator = scratch)
-        signal_sems := make([]vk.Semaphore, signal_count, allocator = scratch)
-        signal_values := make([]u64, signal_count, allocator = scratch)
-        for wait_sem, i in cmd_buf_info.wait_sems
+        for wait_sem in cmd_buf_info.wait_sems
         {
-            wait_sems[i] = pool_get(&ctx.semaphores, wait_sem.sem)
-            wait_stages[i] = { .ALL_COMMANDS }
-            wait_values[i] = wait_sem.val
+            mtl_wait_sem := pool_get(&ctx.semaphores, wait_sem.sem)
+            mtl_queue->waitForEvent(mtl_wait_sem, wait_sem.val)
         }
-        for signal_sem, i in cmd_buf_info.signal_sems
+
+        mtl_queue->commit_count(&cmd_buf_info.handle, 1)
+
+        for signal_sem in cmd_buf_info.signal_sems
         {
-            signal_sems[i] = pool_get(&ctx.semaphores, signal_sem.sem)
-            signal_values[i] = signal_sem.val
+            mtl_signal_sem := pool_get(&ctx.semaphores, signal_sem.sem)
+            mtl_queue->signalEvent(mtl_signal_sem, signal_sem.val)
         }
 
-        signal_sems[signal_count - 1] = vk_queue_sem
-        signal_values[signal_count - 1] = cmd_buf_info.timeline_value
-
-        to_submit := make([]vk.CommandBuffer, 1, allocator = scratch)
-        to_submit[0] = cmd_buf_info.handle
-
-        next := new(vk.TimelineSemaphoreSubmitInfo, allocator = scratch)
-        next^ = {
-            sType = .TIMELINE_SEMAPHORE_SUBMIT_INFO,
-            waitSemaphoreValueCount = u32(len(wait_values)),
-            pWaitSemaphoreValues = raw_data(wait_values),
-            signalSemaphoreValueCount = u32(len(signal_values)),
-            pSignalSemaphoreValues = raw_data(signal_values),
-        }
-        submit_info := vk.SubmitInfo {
-            sType = .SUBMIT_INFO,
-            pNext = next,
-            commandBufferCount = u32(len(to_submit)),
-            pCommandBuffers = raw_data(to_submit),
-            waitSemaphoreCount = u32(len(wait_sems)),
-            pWaitSemaphores = raw_data(wait_sems),
-            pWaitDstStageMask = raw_data(wait_stages),
-            signalSemaphoreCount = u32(len(signal_sems)),
-            pSignalSemaphores = raw_data(signal_sems),
-        }
-        append(&submit_infos, submit_info)
+        mtl_queue->signalEvent(mtl_queue_sem, u64(cmd_buf_info.timeline_value))
     }
-
-    queue_info := ctx.queues[queue]
-    vk_queue := queue_info.handle
-    vk_check(vk.QueueSubmit(vk_queue, u32(len(submit_infos)), raw_data(submit_infos), {}))
 
     for cmd_buf in cmd_bufs {
         recycle_cmd_buf(cmd_buf)
@@ -2895,6 +3132,26 @@ recycle_cmd_buf :: proc(cmd_buf: Command_Buffer)
 
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     priority_queue.push(&tls_ctx.free_buffers[cmd_buf_info.queue], Free_Command_Buffer { pool_handle = cmd_buf_info.pool_handle, timeline_value = cmd_buf_info.timeline_value })
+}
+
+@(private="file")
+hash_cmd_buf_render_state :: proc(cmd_buf_info: Command_Buffer_Info) -> Render_Pipeline_Handle
+{
+    render_state := cmd_buf_info.render_state
+
+    // Nullifying some fields so they don't effect the hash when they're 
+    // changed by user code. These are fields not relevant towards determining
+    // if a new render pipeline needs to be made.
+    render_state.depth_state = {}
+    render_state.raster_state.topology = .Triangle_List
+    render_state.raster_state.cull_mode = .None
+    render_state.viewport = {}
+    render_state.scissor = {}
+    render_state.graphics_shader_source_location = {}
+
+	bytes := mem.ptr_to_bytes(&render_state)
+
+	return Render_Pipeline_Handle(xxhash.XXH64(bytes))
 }
 
 // Interop
@@ -2987,6 +3244,28 @@ _vk_add_device_extension :: proc(extension: cstring)
 _vk_move_semaphore :: proc(semaphore: vk.Semaphore, loc := #caller_location) -> Semaphore
 {
     return pool_add(&ctx.semaphores, semaphore, { name = "", created_at = loc })
+}
+
+@(private="file")
+mtl_update_render_pass_attachment :: proc(attach: Render_Attachment, mtl_attach: ^mtl.RenderPassAttachmentDescriptor)
+{
+    has_output := attach.texture != {}
+    has_resolve := attach.resolve_texture != {}
+
+    if has_output
+    {
+        texture_info := pool_get(&ctx.textures, attach.texture.handle)
+        mtl_attach->setTexture(texture_info.handle)
+    }
+
+    if has_resolve
+    {
+        texture_info := pool_get(&ctx.textures, attach.resolve_texture.handle)
+        mtl_attach->setResolveTexture(texture_info.handle)
+    }
+
+    mtl_attach->setLoadAction(to_mtl_load_op(attach.load_op))
+    mtl_attach->setStoreAction(to_mtl_store_op(attach.store_op))
 }
 
 @(private)
@@ -3238,13 +3517,13 @@ check_texture_descriptor :: proc(desc: Texture_Descriptor, name: string, index: 
 @(private="file")
 texture_descriptor_get_handle :: #force_inline proc(desc: Texture_Descriptor) -> Texture_Handle
 {
-    return transmute(Texture_Handle) (cast([2]u64)desc)[0]
+    return transmute(Texture_Handle) (cast([2]u64)desc)[1]
 }
 
 @(private="file")
-texture_descriptor_get_vk_view :: #force_inline proc(desc: Texture_Descriptor) -> vk.ImageView
+texture_descriptor_get_mtl_texture :: #force_inline proc(desc: Texture_Descriptor) -> ^mtl.Texture
 {
-    return cast(vk.ImageView) (cast([2]u64)desc)[1]
+    return cast(^mtl.Texture) uintptr((cast([2]u64)desc)[0])
 }
 
 vk_set_debug_name :: proc(name: string, handle: u64, type: vk.ObjectType)

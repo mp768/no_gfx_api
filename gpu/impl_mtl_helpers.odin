@@ -13,6 +13,11 @@ import ca "darwodin/QuartzCore"
 import ns "darwodin/Foundation"
 import cf "darwodin/CoreFoundation"
 
+objc_alloc :: proc "contextless" ($T: typeid) -> ^T
+{
+    return (T{})->alloc()
+}
+
 to_mtl_texture_format :: proc(format: Texture_Format) -> mtl.PixelFormat
 {
     no_equivalent :: proc(format: Texture_Format, loc := #caller_location) -> !
@@ -93,7 +98,7 @@ mtl_helper_dimensions_by_texture_format :: proc(format: Texture_Format, dimensio
     return dimensions
 }
 
-to_mtl_filter :: proc(filter: Filter) -> mtl.SamplerMinMagFilter
+to_mtl_filter :: proc "contextless" (filter: Filter) -> mtl.SamplerMinMagFilter
 {
     switch filter
     {
@@ -104,7 +109,23 @@ to_mtl_filter :: proc(filter: Filter) -> mtl.SamplerMinMagFilter
     return .Nearest
 }
 
-to_mtl_address_mode :: proc(mode: Address_Mode) -> mtl.SamplerAddressMode
+to_mtl_stage :: #force_inline proc "contextless" (stage: Stage) -> mtl.Stages
+{
+    switch stage
+    {
+        case .Transfer: return { .StageBlit }
+        case .Compute: return { .StageDispatch }
+        case .Raster_Color_Out: return { .StageFragment }
+        case .Fragment_Shader: return { .StageFragment }
+        case .Vertex_Shader: return { .StageVertex }
+        case .Build_BVH: return { .StageAccelerationStructure }
+        case .All: return { .StageAll }
+    }
+
+    return {}
+}
+
+to_mtl_address_mode :: proc "contextless" (mode: Address_Mode) -> mtl.SamplerAddressMode
 {
     switch mode
     {
@@ -116,16 +137,128 @@ to_mtl_address_mode :: proc(mode: Address_Mode) -> mtl.SamplerAddressMode
     return .ClampToZero
 }
 
+to_mtl_load_op :: proc "contextless" (op: Load_Op) -> mtl.LoadAction
+{
+    switch op
+    {
+        case .Clear: return .Clear  
+        case .Load: return .Load    
+        case .Dont_Care: return .DontCare   
+    }
+
+    return .DontCare
+}
+
+to_mtl_store_op :: proc "contextless" (op: Store_Op) -> mtl.StoreAction
+{
+    switch op
+    {
+        case .Store: return .Store
+        case .Dont_Care: return .DontCare
+        case .Resolve: return .MultisampleResolve
+        case .Resolve_And_Store: return .StoreAndMultisampleResolve
+    }
+
+    return .Unknown
+}
+
+to_mtl_topology :: proc(topology: Topology) -> mtl.PrimitiveType
+{
+    switch topology
+    {
+        case .Triangle_List: return .Triangle
+        case .Triangle_Strip: return .TriangleStrip
+        case .Triangle_Fan: panic("'Topology.Triangle_Fan' does not have an equivalent on the metal 4 backend!")
+    }
+
+    return .Point
+}
+
+to_mtl_blend_factor :: proc "contextless" (blend_factor: Blend_Factor) -> mtl.BlendFactor
+{
+    switch blend_factor
+    {
+        case .Zero: return .Zero
+        case .One: return .One
+        case .Src_Color: return .SourceColor
+        case .Dst_Color: return .DestinationColor
+        case .Src_Alpha: return .SourceAlpha
+        case .Dst_Alpha: return .DestinationAlpha
+        case .One_Minus_Src_Alpha: return .OneMinusSourceAlpha
+        case .One_Minus_Src_Color: return .OneMinusSourceColor
+        case .One_Minus_Dst_Alpha: return .OneMinusDestinationAlpha
+        case .One_Minus_Dst_Color: return .OneMinusDestinationColor
+    }
+
+    return .Zero
+}
+
+to_mtl_blend_op :: proc "contextless" (blend_op: Blend_Op) -> mtl.BlendOperation
+{
+    switch blend_op
+    {
+        case .Add: return .Add
+        case .Subtract: return .Subtract
+        case .Rev_Subtract: return .ReverseSubtract
+        case .Min: return .Min
+        case .Max: return .Max
+    }
+
+    return .Unspecialized
+}
+
+to_mtl_write_mask :: proc "contextless" (mask: Color_Component_Flags) -> mtl.ColorWriteMasks
+{
+    res: mtl.ColorWriteMasks
+    
+    if .R in mask do res |= .Red
+    if .G in mask do res |= .Green
+    if .B in mask do res |= .Blue
+    if .A in mask do res != .Alpha
+
+    return res
+}
+
+to_mtl_compare_op :: proc "contextless" (op: Compare_Op) -> mtl.CompareFunction
+{
+    switch op
+    {
+        case .Never: return .Never
+        case .Less: return .Less
+        case .Equal: return .Equal
+        case .Less_Equal: return .LessEqual
+        case .Greater: return .Greater
+        case .Not_Equal: return .NotEqual
+        case .Greater_Equal: return .GreaterEqual
+        case .Always: return .Always
+    }
+
+    return .Never
+}
+
+to_mtl_cull_mode :: proc "contextless" (cull_mode: Cull_Mode) -> mtl.CullMode
+{
+    switch cull_mode
+    {
+        case .Cull_CW: return .Back
+        case .Cull_CCW: return .Front
+        case .None: return .None
+        case .All: panic("'Cull_Mode.All' does not have an equivalent on the metal 4 backend!")
+    }
+
+    return .None
+}
+
 to_mtl_string :: proc(str: string) -> ^ns.String 
 {
-    objc_str: ^ns.String = (ns.String{})->alloc()
+    objc_str: ^ns.String = ns.String_string()
 
     objc_str->initWithBytes(raw_data(transmute([]byte)str), ns.UInteger(len(str)), ns.UTF8StringEncoding)
     
     return objc_str
 }
 
-to_mtl_texture_usage :: proc(usage: Usage_Flags) -> mtl.TextureUsage
+to_mtl_texture_usage :: proc "contextless" (usage: Usage_Flags) -> mtl.TextureUsage
 {
     res: mtl.TextureUsage
 
@@ -140,7 +273,7 @@ to_mtl_texture_usage :: proc(usage: Usage_Flags) -> mtl.TextureUsage
     return res
 }
 
-to_mtl_texture_descriptor :: proc(desc: Texture_Desc) -> ^mtl.TextureDescriptor
+to_mtl_texture_descriptor :: proc "contextless" (desc: Texture_Desc) -> ^mtl.TextureDescriptor
 {
     res: ^mtl.TextureDescriptor = (mtl.TextureDescriptor{})->alloc()
 
@@ -225,7 +358,7 @@ to_mtl_texture_descriptor :: proc(desc: Texture_Desc) -> ^mtl.TextureDescriptor
 
 // adapted from:
 // https://github.com/libsdl-org/SDL/blob/7bbd9d5c2c6925e5824de4288a1ed0bed0c0e5f7/src/gpu/SDL_sysgpu.h#L604
-mtl_helper_bytes_per_row :: proc(format: Texture_Format, width: u32) -> u32 
+mtl_helper_bytes_per_row :: proc "contextless" (format: Texture_Format, width: u32) -> u32 
 {
     block_width := mtl_helper_texture_format_block_width(format)
     blocks_per_row := (width + block_width - 1) / block_width
@@ -237,7 +370,7 @@ mtl_helper_bytes_per_row :: proc(format: Texture_Format, width: u32) -> u32
 
 // adapted from:
 // https://github.com/libsdl-org/SDL/blob/7bbd9d5c2c6925e5824de4288a1ed0bed0c0e5f7/src/gpu/SDL_gpu.c#L3518
-mtl_helper_bytes_per_image :: proc(format: Texture_Format, width, height, depth_or_layers: u32) -> u32
+mtl_helper_bytes_per_image :: proc "contextless" (format: Texture_Format, width, height, depth_or_layers: u32) -> u32
 {
     block_width := max(mtl_helper_texture_format_block_width(format), 1)
     block_height := max(mtl_helper_texture_format_block_height(format), 1)
@@ -252,7 +385,7 @@ mtl_helper_bytes_per_image :: proc(format: Texture_Format, width, height, depth_
 
 // adapted from:
 // https://github.com/libsdl-org/SDL/blob/7bbd9d5c2c6925e5824de4288a1ed0bed0c0e5f7/src/gpu/SDL_sysgpu.h#L157
-mtl_helper_texture_format_block_width :: proc(format: Texture_Format) -> u32 
+mtl_helper_texture_format_block_width :: proc "contextless" (format: Texture_Format) -> u32 
 {
     switch format
     {
@@ -276,7 +409,7 @@ mtl_helper_texture_format_block_width :: proc(format: Texture_Format) -> u32
 
 // adapted from:
 // https://github.com/libsdl-org/SDL/blob/7bbd9d5c2c6925e5824de4288a1ed0bed0c0e5f7/src/gpu/SDL_sysgpu.h#L278
-mtl_helper_texture_format_block_height :: proc(format: Texture_Format) -> u32
+mtl_helper_texture_format_block_height :: proc "contextless" (format: Texture_Format) -> u32
 {
     switch format
     {
@@ -298,7 +431,7 @@ mtl_helper_texture_format_block_height :: proc(format: Texture_Format) -> u32
 
 // adapted from:
 // https://github.com/libsdl-org/SDL/blob/7bbd9d5c2c6925e5824de4288a1ed0bed0c0e5f7/src/gpu/SDL_gpu.c#L814
-mtl_helper_texture_format_texel_block_byte_size :: proc(format: Texture_Format) -> u32
+mtl_helper_texture_format_texel_block_byte_size :: proc "contextless" (format: Texture_Format) -> u32
 {
     switch format 
     {
