@@ -9,6 +9,8 @@ import "../../gpu"
 
 import sdl "vendor:sdl3"
 
+import "core:unicode/utf8"
+
 Start_Window_Size_X :: 1000
 Start_Window_Size_Y :: 1000
 Frames_In_Flight :: 3
@@ -28,7 +30,7 @@ main :: proc()
 
     window_flags :: sdl.WindowFlags {
         .HIGH_PIXEL_DENSITY,
-        .VULKAN,
+        .METAL,
         .RESIZABLE,
     }
     window := sdl.CreateWindow(Example_Name, Start_Window_Size_X, Start_Window_Size_Y, window_flags)
@@ -43,8 +45,13 @@ main :: proc()
 
     gpu.swapchain_init_from_sdl(window, Frames_In_Flight)
 
-    vert_shader := gpu.shader_create(#load("shaders/shader.vert.spv", []u32), .Vertex)
-    frag_shader := gpu.shader_create(#load("shaders/shader.frag.spv", []u32), .Fragment)
+    msl_source := #load("shaders/output.metal")
+    msl_source_runes := utf8.string_to_runes(string(msl_source))
+
+    msl_source_disguised := transmute([]u32) msl_source_runes
+
+    vert_shader := gpu.shader_create(msl_source_disguised, .Vertex)
+    frag_shader := gpu.shader_create(msl_source_disguised, .Fragment)
     defer {
         gpu.shader_destroy(vert_shader)
         gpu.shader_destroy(frag_shader)

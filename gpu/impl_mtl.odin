@@ -452,6 +452,7 @@ mtl_create_residency_set :: proc(initial_capacity: u32, $set_type: string) -> ^m
 
 _cleanup :: proc(loc := #caller_location)
 {
+    /*
     scratch, _ := acquire_scratch()
 
     {
@@ -582,6 +583,7 @@ _cleanup :: proc(loc := #caller_location)
     } else {
         runtime.debug_trap()  // Break here so user has a chance to read the last error logs.
     }
+    */
 }
 
 _wait_idle :: proc()
@@ -697,7 +699,7 @@ _swapchain_present :: proc(queue: Queue, sem_wait: Semaphore, wait_value: u64)
     (ctx.swapchain.current_drawable)->present()
 
     // TODO: Complete this logic...
-        
+    /*
     vk_sem_wait := pool_get(&ctx.semaphores, sem_wait)
 
     present_semaphore := ctx.swapchain.present_semaphores[ctx.swapchain_image_idx]
@@ -807,6 +809,7 @@ _swapchain_present :: proc(queue: Queue, sem_wait: Semaphore, wait_value: u64)
     if res != .SUCCESS && res != .SUBOPTIMAL_KHR {
         vk_check(res)
     }
+    */
 }
 
 _features_available :: proc() -> Features
@@ -1712,7 +1715,7 @@ _queue_submit :: proc(queue: Queue, cmd_bufs: []Command_Buffer, loc := #caller_l
         mtl_cmd_buf->endCommandBuffer()
     }
 
-    // NOTE: Submission already recycles cmd buffers for us
+    // NOTE: Submission already recycles and clears cmd buffers for us
     mtl_submit_cmd_bufs(cmd_bufs)
 }
 
@@ -1887,6 +1890,7 @@ _cmd_blit_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, dst_rect: Blit_
     encoder := mtl_get_compute_encoder(cmd_buf, loc = loc)
 
     // TODO: Implement this
+    /*
 
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     src_info := pool_get(&ctx.textures, src.handle)
@@ -1931,6 +1935,7 @@ _cmd_blit_texture :: proc(cmd_buf: Command_Buffer, dst: Texture, dst_rect: Blit_
     }
 
     vk.CmdBlitImage(cmd_buf_info.handle, src_info.handle, .GENERAL, dst_info.handle, .GENERAL, 1, &region, vk_filter)
+    */
 }
 
 _cmd_set_desc_heap :: proc(cmd_buf: Command_Buffer, heap: Descriptor_Heap, loc := #caller_location)
@@ -2215,11 +2220,13 @@ _cmd_dispatch :: proc(cmd_buf: Command_Buffer, compute_data: gpuptr, num_groups_
     }
 
     mtl_push_constant(cmd_buf, push_constants)
-    
+
+    /*
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     mtl_cmd_buf := cmd_buf_info.handle
 
     vk.CmdDispatch(vk_cmd_buf, num_groups_x, num_groups_y, num_groups_z)
+    */
 }
 
 _cmd_dispatch_indirect_raw :: proc(cmd_buf: Command_Buffer, compute_data, arguments: gpuptr, loc := #caller_location)
@@ -2234,6 +2241,7 @@ _cmd_dispatch_indirect_raw :: proc(cmd_buf: Command_Buffer, compute_data, argume
         if !ok do return
     }
 
+    /*
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     vk_cmd_buf := cmd_buf_info.handle
 
@@ -2247,6 +2255,7 @@ _cmd_dispatch_indirect_raw :: proc(cmd_buf: Command_Buffer, compute_data, argume
     vk.CmdPushConstants(vk_cmd_buf, ctx.common_pipeline_layout_compute, { .COMPUTE }, 0, size_of(Compute_Shader_Push_Constants), &push_constants)
 
     vk.CmdDispatchIndirect(vk_cmd_buf, arguments_buf, vk.DeviceSize(arguments_offset))
+    */
 }
 
 _cmd_begin_render_pass :: proc(cmd_buf: Command_Buffer, desc: Render_Pass_Desc, loc := #caller_location)
@@ -2571,8 +2580,9 @@ _cmd_draw_indexed_raw :: proc(cmd_buf: Command_Buffer, vertex_data, fragment_dat
         if !ok do return
     }
 
-    cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
-    vk_cmd_buf := cmd_buf.handle
+    encoder := mtl_get_render_encoder(cmd_buf, loc = loc)
+    
+    cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
 
     indices_buf, indices_offset, ok_i := get_buf_offset_from_gpu_ptr(indices)
     assert(ok_i)
@@ -2582,10 +2592,17 @@ _cmd_draw_indexed_raw :: proc(cmd_buf: Command_Buffer, vertex_data, fragment_dat
         frag_data = fragment_data.ptr,
         indirect_data = nil,
     }
-    vk.CmdPushConstants(vk_cmd_buf, ctx.common_pipeline_layout_graphics, { .VERTEX, .FRAGMENT }, 0, size_of(Graphics_Shader_Push_Constants), &push_constants)
+    mtl_push_constant(cmd_buf, push_constants, loc = loc)
+    mtl_set_up_render_state(cmd_buf_info, encoder, loc = loc)
 
-    vk.CmdBindIndexBuffer(vk_cmd_buf, indices_buf, vk.DeviceSize(indices_offset), to_vk_index_format(index_format))
-    vk.CmdDrawIndexed(vk_cmd_buf, index_count, instance_count, 0, 0, 0)
+    encoder->drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferLength_instanceCount(
+        to_mtl_topology(cmd_buf_info.raster_state.topology),
+        ns.UInteger(index_count),
+        .UInt32 if index_format == .U32 else .UInt16,
+        indices_buf->gpuAddress(),
+        ns.UInteger(index_count * (4 if index_format == .U32 else 2)),
+        ns.UInteger(instance_count)
+    )
 }
 
 _cmd_draw_indexed_indirect_raw :: proc(cmd_buf: Command_Buffer, vertex_data, fragment_data, indices: gpuptr, index_format: Index_Format, indirect_arguments: gpuptr, loc := #caller_location)
@@ -2601,6 +2618,7 @@ _cmd_draw_indexed_indirect_raw :: proc(cmd_buf: Command_Buffer, vertex_data, fra
         if !ok do return
     }
 
+    /*
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     vk_cmd_buf := cmd_buf_info.handle
 
@@ -2616,6 +2634,7 @@ _cmd_draw_indexed_indirect_raw :: proc(cmd_buf: Command_Buffer, vertex_data, fra
 
     vk.CmdBindIndexBuffer(vk_cmd_buf, indices_buf, vk.DeviceSize(indices_offset), to_vk_index_format(index_format))
     vk.CmdDrawIndexedIndirect(vk_cmd_buf, arguments_buf, vk.DeviceSize(arguments_offset), 1, 0)
+    */
 }
 
 _cmd_draw_indexed_indirect_multi_raw :: proc(cmd_buf: Command_Buffer, vertex_data, fragment_data, indices: gpuptr,
@@ -2633,6 +2652,7 @@ _cmd_draw_indexed_indirect_multi_raw :: proc(cmd_buf: Command_Buffer, vertex_dat
         if !ok do return
     }
 
+    /*
     cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
 
     vk_cmd_buf := cmd_buf.handle
@@ -2696,6 +2716,7 @@ _cmd_draw_indexed_indirect_multi_raw :: proc(cmd_buf: Command_Buffer, vertex_dat
     }
 
     vk.CmdDrawIndexedIndirectCount(vk_cmd_buf, arguments_buf, vk.DeviceSize(arguments_offset), draw_count_buf, vk.DeviceSize(draw_count_offset), max_draw_count, stride)
+    */
 }
 
 _cmd_build_blas :: proc(cmd_buf: Command_Buffer, bvh: BVH, scratch_storage: gpuptr, shapes: []BVH_Shape, loc := #caller_location)
@@ -2709,6 +2730,7 @@ _cmd_build_blas :: proc(cmd_buf: Command_Buffer, bvh: BVH, scratch_storage: gpup
         if !ok do return
     }
 
+    /*
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     vk_cmd_buf := cmd_buf_info.handle
     bvh_info := pool_get(&ctx.bvhs, bvh)
@@ -2770,6 +2792,7 @@ _cmd_build_blas :: proc(cmd_buf: Command_Buffer, bvh: BVH, scratch_storage: gpup
     // We always build one at a time, so we only need a pointer to an array (double pointer).
     range_infos_ptr := raw_data(range_infos)
     vk.CmdBuildAccelerationStructuresKHR(vk_cmd_buf, 1, &build_info, &range_infos_ptr)
+    */
 }
 
 _cmd_build_tlas :: proc(cmd_buf: Command_Buffer, bvh: BVH, scratch_storage, instances: gpuptr, loc := #caller_location)
@@ -2784,6 +2807,7 @@ _cmd_build_tlas :: proc(cmd_buf: Command_Buffer, bvh: BVH, scratch_storage, inst
         if !ok do return
     }
 
+    /*
     cmd_buf_info := pool_get(&ctx.command_buffers, cmd_buf)
     bvh_info := pool_get(&ctx.bvhs, bvh)
     vk_cmd_buf := cmd_buf_info.handle
@@ -2807,6 +2831,7 @@ _cmd_build_tlas :: proc(cmd_buf: Command_Buffer, bvh: BVH, scratch_storage, inst
     }
     range_info_ptr := raw_data(range_info)
     vk.CmdBuildAccelerationStructuresKHR(vk_cmd_buf, 1, &build_info, &range_info_ptr)
+    */
 }
 
 _cmd_begin_debug_label :: proc(cmd_buf: Command_Buffer, name: string, color: [4]f32, loc := #caller_location)
@@ -2818,6 +2843,7 @@ _cmd_begin_debug_label :: proc(cmd_buf: Command_Buffer, name: string, color: [4]
         if !ok do return
     }
 
+    /*
     scratch, _ := acquire_scratch()
     name_cstr := strings.clone_to_cstring(name, allocator = scratch)
 
@@ -2827,6 +2853,7 @@ _cmd_begin_debug_label :: proc(cmd_buf: Command_Buffer, name: string, color: [4]
         pLabelName = name_cstr,
         color = color,
     })
+    */
 }
 
 _cmd_end_debug_label :: proc(cmd_buf: Command_Buffer, loc := #caller_location)
@@ -2838,8 +2865,10 @@ _cmd_end_debug_label :: proc(cmd_buf: Command_Buffer, loc := #caller_location)
         if !ok do return
     }
 
+    /*
     vk_cmd_buf := pool_get(&ctx.command_buffers, cmd_buf).handle
     vk.CmdEndDebugUtilsLabelEXT(vk_cmd_buf)
+    */
 }
 
 _cmd_insert_debug_label :: proc(cmd_buf: Command_Buffer, name: string, color: [4]f32, loc := #caller_location)
@@ -2851,6 +2880,7 @@ _cmd_insert_debug_label :: proc(cmd_buf: Command_Buffer, name: string, color: [4
         if !ok do return
     }
 
+    /*
     scratch, _ := acquire_scratch()
     name_cstr := strings.clone_to_cstring(name, allocator = scratch)
 
@@ -2860,6 +2890,7 @@ _cmd_insert_debug_label :: proc(cmd_buf: Command_Buffer, name: string, color: [4
         pLabelName = name_cstr,
         color = color,
     })
+    */
 }
 
 @(private="file")
@@ -3075,44 +3106,56 @@ hash_cmd_buf_render_state :: proc(cmd_buf_info: Command_Buffer_Info) -> Render_P
 
 _vk_get_instance :: proc() -> vk.Instance
 {
-    return ctx.instance
+    return {}
+    // return ctx.instance
 }
 
 _vk_get_physical_device :: proc() -> vk.PhysicalDevice
 {
-    return ctx.phys_device
+    return {}
+    // return ctx.phys_device
 }
 
 _vk_get_device :: proc() -> vk.Device
 {
-    return ctx.device
+    return {}
+    // return ctx.device
 }
 
 _vk_get_queue :: proc(queue: Queue) -> vk.Queue
 {
-    return ctx.queues[queue].handle
+    return {}
+    // return ctx.queues[queue].handle
 }
 
 _vk_get_queue_family :: proc(queue: Queue) -> u32
 {
-    return ctx.queues[queue].family_idx
+    return 0
+    // return ctx.queues[queue].family_idx
 }
 
 _vk_get_command_buffer :: proc(cmd_buf: Command_Buffer) -> vk.CommandBuffer
 {
+    return {}
+    /*
     cmd_buf := pool_get(&ctx.command_buffers, cmd_buf)
     return cmd_buf.handle
+    */
 }
 
 _vk_get_swapchain_image_count :: proc() -> u32
 {
-    return u32(len(ctx.swapchain.images))
+    return 0
+    // return u32(len(ctx.swapchain.images))
 }
 
 _vk_get_image :: proc(texture: Texture) -> vk.Image
 {
+    return {}
+    /*
     image := pool_get(&ctx.textures, texture.handle)
     return image.handle
+    */
 }
 
 _vk_get_buffer :: proc(addr: gpuptr) -> (vk.Buffer, u32)
@@ -3126,6 +3169,9 @@ _vk_wrap_image :: proc(image: vk.Image, desc: Texture_Desc, name := "", loc := #
 {
     desc_clean := texture_desc_cleanup(desc)
 
+    return {}
+
+    /*
     if ctx.validation {
         ensure(image != {}, "Cannot wrap a nil VkImage.")
     }
@@ -3144,6 +3190,7 @@ _vk_wrap_image :: proc(image: vk.Image, desc: Texture_Desc, name := "", loc := #
         layer_count = desc_clean.layer_count,
         handle = pool_add(&ctx.textures, tex_info, { name = name, created_at = loc }),
     }
+    */
 }
 
 @(thread_local) EXTRA_OPT_DEVICE_EXTENSIONS: [dynamic]cstring
@@ -3160,7 +3207,8 @@ _vk_add_device_extension :: proc(extension: cstring)
 
 _vk_move_semaphore :: proc(semaphore: vk.Semaphore, loc := #caller_location) -> Semaphore
 {
-    return pool_add(&ctx.semaphores, semaphore, { name = "", created_at = loc })
+    return {}
+    // return pool_add(&ctx.semaphores,semaphore, { name = "", created_at = loc })
 }
 
 @(private="file")
@@ -3187,73 +3235,6 @@ mtl_update_render_pass_attachment :: proc(attach: Render_Attachment, mtl_attach:
 
     mtl_attach->setLoadAction(to_mtl_load_op(attach.load_op))
     mtl_attach->setStoreAction(to_mtl_store_op(attach.store_op))
-}
-
-@(private)
-to_vk_render_attachment :: #force_inline proc(attach: Render_Attachment) -> vk.RenderingAttachmentInfo
-{
-    view_desc := attach.view
-    texture := attach.texture
-    resolve_texture := attach.resolve_texture
-    resolve_view_desc := attach.resolve_view
-
-    has_output := texture != {}
-    vk_image := pool_get(&ctx.textures, texture.handle).handle if has_output else vk.Image(0)
-    has_resolve := resolve_texture != {}
-    vk_resolve_image := pool_get(&ctx.textures, resolve_texture.handle).handle if has_resolve else vk.Image(0)
-
-    view_desc_clean := texture_view_desc_cleanup(texture, view_desc)
-    resolve_view_desc_clean := texture_view_desc_cleanup(resolve_texture, resolve_view_desc)
-
-    plane_aspect := to_vk_image_aspect_flags(view_desc_clean.format)
-
-    view: vk.ImageView
-    if has_output
-    {
-        image_view_ci := vk.ImageViewCreateInfo {
-            sType = .IMAGE_VIEW_CREATE_INFO,
-            image = vk_image,
-            viewType = to_vk_texture_view_type(view_desc_clean.type),
-            format = to_vk_texture_format(view_desc_clean.format),
-            subresourceRange = {
-                aspectMask = plane_aspect,
-                levelCount = 1,
-                layerCount = 1,
-            }
-        }
-        view = get_or_add_image_view(texture.handle, image_view_ci)
-    }
-
-    resolve_view: vk.ImageView
-    if has_resolve
-    {
-        resolve_image_view_ci := vk.ImageViewCreateInfo {
-            sType = .IMAGE_VIEW_CREATE_INFO,
-            image = vk_resolve_image,
-            viewType = to_vk_texture_view_type(resolve_view_desc_clean.type),
-            format = to_vk_texture_format(resolve_view_desc_clean.format),
-            subresourceRange = {
-                aspectMask = plane_aspect,
-                levelCount = 1,
-                layerCount = 1,
-            }
-        }
-        resolve_view = get_or_add_image_view(resolve_texture.handle, resolve_image_view_ci)
-    }
-
-    vk_store_op, vk_resolve_mode := to_vk_store_op(attach.store_op)
-
-    return {
-        sType = .RENDERING_ATTACHMENT_INFO,
-        imageView = view,
-        imageLayout = .GENERAL,
-        loadOp = to_vk_load_op(attach.load_op),
-        storeOp = vk_store_op,
-        clearValue = { color = { float32 = attach.clear_color } },
-        resolveMode = vk_resolve_mode,
-        resolveImageView = resolve_view,
-        resolveImageLayout = .GENERAL if has_resolve else {},
-    }
 }
 
 //////////////////////////////////////

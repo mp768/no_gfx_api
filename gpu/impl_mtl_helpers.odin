@@ -15,7 +15,7 @@ import cf "darwodin/CoreFoundation"
 
 objc_alloc :: proc "contextless" ($T: typeid) -> ^T
 {
-    return (T{})->alloc()
+    return T.alloc()
 }
 
 to_mtl_texture_format :: proc(format: Texture_Format) -> mtl.PixelFormat
